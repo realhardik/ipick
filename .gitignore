@@ -1,0 +1,57 @@
+*.iml
+.gradle/
+/local.properties
+/.idea/
+.DS_Store
+/build
+/captures
+.externalNativeBuild
+.cxx
+/app/build/
+/app/pure-tests/build/
+
+# Signing material has never been in this repo and never will be. CI decodes a
+# base64 secret to a file and points IPICK_KEYSTORE at it.
+*.jks
+*.keystore
+keystore.properties
+
+# shellprobe build output - the source and the result are what matter
+/shellprobe/build/
+/shellprobe/*.jar
+
+/shellserver/build/
+/shellserver/tests/build/
+/shellserver/lint/build/
+/shellserver/*.jar
+
+# NEVER commit captured audio. Testing a call recorder produces recordings of
+# real phone calls with real people in them, and a private conversation is not
+# evidence anyone else needs. Whatever a capture proves, it proves as a
+# measurement, in words.
+*.wav
+*.opus
+*.ogg
+*.pcm
+
+# Generated: copied from shellserver by the copyShellServer Gradle task
+/app/src/main/assets/ipick-capture.jar
+
+# Release output. The APK belongs on a Releases page, not in a git history.
+*.apk
+*.aab
+
+# Python bytecode from tools/
+__pycache__/
+*.pyc
+
+# Claude Code local state
+.claude/
+
+# The VoIP probe (shellserver/probe): a test tool, built by hand, never shipped
+/shellserver/probe/build/
+/shellserver/probe/voip-probe.jar
+
+# Generated stock greetings shipped with the app.
+!/app/src/main/assets/greetings/idle.pcm
+!/app/src/main/assets/greetings/dnd.pcm

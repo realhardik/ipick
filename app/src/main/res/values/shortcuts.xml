@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="volume_shortcut_name">Voicemail volume shortcut</string>
+    <string name="volume_shortcut_description">When enabled in Voicemail settings, hold Volume Up for one second during a ringing call to send it to voicemail. This service observes button presses and does not read your screen. Other accessibility services may prevent Android from delivering button events.</string>
+</resources>

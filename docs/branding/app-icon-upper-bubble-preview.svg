@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="18 18 72 72">
+  <title>IPick — phone with a connected message bubble</title>
+  <rect x="18" y="18" width="72" height="72" rx="16" fill="#2247ED"/>
+  <path fill="white" d="M37.9,50.7 C40.9,56.7 45.8,61.5 51.8,64.6 L56.4,60 C57,59.4 57.9,59.2 58.7,59.6 C61.7,60.6 64.8,61.2 68.1,61.2 C69.3,61.2 70.2,62.1 70.2,63.3 L70.2,70.6 C70.2,71.8 69.3,72.7 68.1,72.7 C47.2,72.7 30.3,55.8 30.3,34.9 C30.3,33.7 31.2,32.8 32.4,32.8 L39.8,32.8 C41,32.8 41.9,33.7 41.9,34.9 C41.9,38.2 42.4,41.3 43.5,44.3 C43.8,45.1 43.6,46 43,46.6 Z"/>
+  <path fill="none" stroke="white" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round" d="M57,30 L71,30 C75.4,30 79,33.6 79,38 L79,45 C79,49.4 75.4,53 71,53 L57,53 C52.6,53 49,49.4 49,45 L41,40 L49,38 C49,33.6 52.6,30 57,30 Z"/>
+  <path fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" d="M57,38 L70,38 M57,45 L66,45"/>
+</svg>
