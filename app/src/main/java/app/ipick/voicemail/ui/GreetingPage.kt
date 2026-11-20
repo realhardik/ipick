@@ -42,8 +42,7 @@ internal fun GreetingPage(modifier: Modifier, a: AnswerUi, current: StatusState,
         verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Text("Greetings", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
         Text("What callers hear before leaving a message.")
-        Text(if (current.mode == ResponseMode.AUTO_TEXT) "Auto-text is on. Enable voicemail in Settings to use greetings."
-            else "Calls currently use your ${current.status.title} greeting.", color = MaterialTheme.colorScheme.primary)
+        Text("Greeting for your current status: ${current.status.title}.", color = MaterialTheme.colorScheme.primary)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Availability.entries.forEach { value ->
                 FilterChip(selected = status == value, onClick = { ctl.edit(value) }, enabled = !busy,

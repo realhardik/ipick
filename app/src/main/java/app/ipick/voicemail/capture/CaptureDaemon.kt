@@ -129,7 +129,7 @@ object CaptureDaemon {
      * daemon is told apart from a current one, so ensureRunning() can replace
      * it - it cannot be spoken to otherwise.
      */
-    private const val PROTOCOL_VERSION = 2
+    private const val PROTOCOL_VERSION = 3
     private const val LEGACY_PROTOCOL_VERSION = 1
 
     /** First byte of every connection: a bare ping, or the handshake. */
@@ -154,16 +154,13 @@ object CaptureDaemon {
     /** Exact call tracking on or off (CallTracking): the daemon allows or
      *  withdraws MANAGE_ONGOING_CALLS for this app's uid. */
     private const val COMMAND_SET_TRACKING = 'T'.code.toByte()
-    /** Leave out the phone call ringing or being dialled - the rules said so
-     *  before it was recorded (CallTracker). 1 skips, 0 takes it back. */
-    private const val COMMAND_SKIP = 'K'.code.toByte()
-
     /** The answering machine: its settings, the go-ahead for a ringing call,
      *  Talk to them / Hang up, the greeting, and the diagnostics. See Main in
      *  the daemon for each. */
     private const val COMMAND_ANSWER_SETTINGS = 'N'.code.toByte()
-    private const val COMMAND_GO_AHEAD = 'Y'.code.toByte()
-    private const val COMMAND_HANDOVER = 'H'.code.toByte()
+    private const val COMMAND_RING_TOKEN = 'r'.code.toByte()
+    private const val COMMAND_GO_AHEAD = 'y'.code.toByte()
+    private const val COMMAND_HANDOVER = 'h'.code.toByte()
     private const val COMMAND_GREETING = 'G'.code.toByte()
     private const val COMMAND_DIAGNOSE = 'X'.code.toByte()
 
@@ -389,7 +386,7 @@ object CaptureDaemon {
         val socket = Socket()
         try {
             socket.connect(InetSocketAddress(LOOPBACK, PORT), connectMs)
-            socket.soTimeout = REPLY_MS
+            socket.soTimeout = if (command == COMMAND_RING_TOKEN) readMs else REPLY_MS
             val key = token(context).toByteArray()
             val ours = ByteArray(NONCE_BYTES).also(random::nextBytes)
             val out = socket.getOutputStream()
@@ -789,7 +786,7 @@ object CaptureDaemon {
         val port = StartWithoutWifi.PORT
         // Whatever adbd answers: the restart can cut its line off (restartAdbd),
         // and what was asked for is read back from the property below.
-        val reply = AdbTransport.restartAdbd(if (open) "tcpip:$port" else "usb:")
+        val reply = AdbTransport.restartAdbd(context, if (open) "tcpip:$port" else "usb:")
         ReviveLog.note(
             context,
             "revive: ${if (open) "opening" else "closing"} port $port, adbd said " +
@@ -851,11 +848,9 @@ object CaptureDaemon {
         // the keep-alive had under way, halfway through starting the recorder.
         lifecycle.withLock {
             if (!StartWithoutWifi.openedThisBoot(context) || StartWithoutWifi.portSet() == false) return@withLock true
-            if (!AdbTransport.isConnected &&
-                AdbTransport.connect(context, AdbTransport.LOOPBACK, StartWithoutWifi.PORT).isFailure
-            ) return@withLock false
+            if (!AdbTransport.isConnected && AdbTransport.autoConnect(context).isFailure) return@withLock false
             // Its answer is no guide: the restart can cut it off (restartAdbd).
-            AdbTransport.restartAdbd("usb:")
+            AdbTransport.restartAdbd(context, "usb:")
             AdbTransport.close()
             delay(ADBD_RESTART_MS)
             val closed = closeTook()
@@ -896,7 +891,7 @@ object CaptureDaemon {
         // Nor where Android refused Wireless debugging on this Wi-Fi and it is
         // still off: switching it on for the port would only ask again.
         if (NetworkRevive.stillRefusedHere(context, wirelessDebuggingOn(context))) return null
-        return (step ?: StartWithoutWifi.step(context)).takeIf { it != StartWithoutWifi.PortStep.LEAVE }
+        return (step ?: StartWithoutWifi.step(context)).takeUnless { it == StartWithoutWifi.PortStep.LEAVE }
     }
 
     private fun wirelessDebuggingOn(context: Context) = GlobalSettings.isOn(context, GlobalSettings.ADB_WIFI_ENABLED)
@@ -1012,25 +1007,28 @@ object CaptureDaemon {
             ?.takeIf { it.startsWith("OFF") }
 
     /** The answering machine's settings, to the daemon. Best-effort, like the mode. */
-    suspend fun setAnswering(context: Context, settings: String = AnsweringMachine.wire(context)): Boolean =
+    private val answeringSync = Mutex()
+
+    suspend fun setAnswering(context: Context): Boolean = answeringSync.withLock {
+        val settings = AnsweringMachine.wire(context)
         ask(context, COMMAND_ANSWER_SETTINGS, nameFrame(settings)) == "ANSWER $settings"
+    }
 
     /** Answer the ringing call [delayMs] after it began to ring, or take the
      *  go-ahead back (negative). [rangAt] is when this app saw the ring, on
      *  SystemClock.elapsedRealtime - the daemon's clock too: it ignores a
      *  go-ahead for a ring that has ended since. The daemon's state after,
      *  or null. */
-    suspend fun goAhead(context: Context, delayMs: Int, rangAt: Long): String? =
+    suspend fun goAhead(context: Context, delayMs: Int, rangAt: Long, ring: Long): String? =
         ask(
             context, COMMAND_GO_AHEAD,
-            java.nio.ByteBuffer.allocate(12).putInt(delayMs).putLong(rangAt).array(),
+            java.nio.ByteBuffer.allocate(20).putInt(delayMs).putLong(rangAt).putLong(ring).array(),
             readMs = 1_500,
         )
 
-    /** Query then answer only that exact helper-side ring. Zero never arms a call. */
-    suspend fun manualRingToken(context: Context): Long? =
-        ask(context, 'J'.code.toByte(), java.nio.ByteBuffer.allocate(8).putLong(0).array())
-            ?.takeIf { it.startsWith("RING ") }?.substringAfter(' ')?.toLongOrNull()?.takeIf { it > 0 }
+    suspend fun ringingToken(context: Context, createdAt: Long): Long? =
+        ask(context, COMMAND_RING_TOKEN, java.nio.ByteBuffer.allocate(8).putLong(createdAt).array(), readMs = 750)
+            ?.takeIf { it.startsWith("RING ") }?.substringAfter(' ')?.toLongOrNull()?.takeIf { it >= 0 }
 
     suspend fun excludeRingingCall(context: Context, token: Long): Boolean = token > 0 &&
         ask(context, 'I'.code.toByte(), java.nio.ByteBuffer.allocate(8).putLong(token).array()) == "IGNORE yes"
@@ -1043,9 +1041,12 @@ object CaptureDaemon {
     }
 
     /** During a message: Talk to them, or Hang up. */
-    suspend fun handOver(context: Context, talk: Boolean): Boolean =
-        ask(context, COMMAND_HANDOVER, byteArrayOf((if (talk) 'T' else 'H').code.toByte()), readMs = 5_000)
-            ?.let { if (talk) it == "HAND TALKING" else it.startsWith("HAND ") } == true
+    suspend fun handOver(context: Context, talk: Boolean, session: String): Boolean {
+        if (!session.matches(Regex("[0-9a-f-]{36}"))) return false
+        return ask(context, COMMAND_HANDOVER,
+            byteArrayOf((if (talk) 'T' else 'H').code.toByte()) + nameFrame(session), readMs = 5_000)
+            ?.let { if (talk) it == "HAND TALKING" else it.startsWith("HAND ") && it != "HAND stale" && it != "HAND none" } == true
+    }
 
     /** How many bytes of greeting the daemon has; null if it cannot say. */
     suspend fun greetingBytes(context: Context): Long? =
@@ -1171,16 +1172,6 @@ object CaptureDaemon {
         }.getOrDefault(false)
     }
 
-    /** Ask the daemon not to record the phone call starting now. Whether it
-     *  understood: an older one hangs up, and the saver deletes it after. */
-    suspend fun skipCall(context: Context, skip: Boolean): Boolean = withContext(Dispatchers.IO) {
-        runCatching {
-            open(context, COMMAND_SKIP, byteArrayOf(if (skip) 1 else 0), readMs = 1_500).use { socket ->
-                socket.getInputStream().bufferedReader().readLine()?.startsWith("SKIP ") == true
-            }
-        }.getOrDefault(false)
-    }
-
     /**
      * Tell the daemon which messenger apps' calls to record. It arms its
      * audio policy with the first and disarms with the last; see Voip in the
@@ -1256,23 +1247,27 @@ object CaptureDaemon {
         }
     }
 
-    /**
-     * The secret shared with the daemon: it wakes the recording service with
-     * it, and since protocol 2 every loopback command is proved with it.
-     *
-     * Generated once and kept in preferences. It has to survive across app
-     * restarts because the daemon outlives them: a token minted on every launch
-     * would be wrong the moment the app process was recreated while the daemon
-     * was not, which is the normal case. It reaches the daemon only through
-     * its environment at spawn (see ensureRunning) and never crosses a socket.
-     */
+    @Volatile
+    private var cachedToken: String? = null
+
+    @Synchronized
     fun token(context: Context): String {
+        cachedToken?.let { return it }
         val prefs = Prefs.of(context)
-        prefs.getString(KEY_TOKEN, null)?.let { return it }
-        val fresh = ByteArray(24).also { random.nextBytes(it) }
-            .joinToString("") { "%02x".format(it) }
-        prefs.edit { putString(KEY_TOKEN, fresh) }
-        return fresh
+        val name = "helper_token"
+        val storage = app.ipick.voicemail.security.SecretStorage
+        val value = if (storage.exists(context, name)) {
+            storage.read(context, name).toString(Charsets.UTF_8)
+        } else {
+            val fresh = prefs.getString(KEY_TOKEN, null) ?: ByteArray(24).also { random.nextBytes(it) }
+                .joinToString("") { "%02x".format(it) }
+            storage.write(context, name, fresh.toByteArray(Charsets.UTF_8))
+            fresh
+        }
+        check(value.matches(Regex("[0-9a-f]{48}"))) { "Invalid helper credential" }
+        if (prefs.contains(KEY_TOKEN)) check(prefs.edit().remove(KEY_TOKEN).commit()) { "Could not remove old helper credentials" }
+        cachedToken = value
+        return value
     }
 
     /**
@@ -1595,18 +1590,6 @@ object CaptureDaemon {
             // setsid puts the daemon in a new session with its own process
             // group, so there is nothing left for that teardown to kill.
             //
-            // The token and the mode ride in the ENVIRONMENT, not the
-            // arguments. Arguments are visible to every app through
-            // /proc/<pid>/cmdline; the environment of a shell-uid process is
-            // readable only by shell and root. The token is what lets the
-            // daemon wake this app's service without that service being
-            // startable by anything else on the phone, and what every loopback
-            // command is proved with. The mode is there so the daemon knows
-            // from its first millisecond whether this call should be recorded,
-            // asked about, or left alone - a push over the socket a moment
-            // later used to be the only word it got, and a call in that gap
-            // was recorded whatever the user had chosen.
-            //
             // KEEP THE PREVIOUS INSTANCE'S LOG. It is the only durable record of
             // what happened before this spawn - logcat's main buffer rolls in
             // about a minute on this phone - and a spawn that truncated it has
@@ -1615,7 +1598,7 @@ object CaptureDaemon {
             // clutter in /data/local/tmp.
             exec(
                 "mv -f $LOG_PATH $LOG_PATH.1 2>/dev/null; " +
-                    "IPICK_TOKEN=${token(context)} IPICK_MODE=${currentMode(context)} " +
+                    "IPICK_MODE=${currentMode(context)} " +
                     "IPICK_VOIP=${VoipApps.wire(context)} " +
                     "IPICK_TRACK=${if (CallTracking.enabled(context)) 1 else 0} " +
                     "IPICK_ANSWER=${AnsweringMachine.wire(context)} " +

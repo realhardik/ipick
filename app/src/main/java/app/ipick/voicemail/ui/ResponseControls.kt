@@ -16,7 +16,7 @@ import app.ipick.voicemail.answering.AnsweringMachine
 import app.ipick.voicemail.response.*
 
 @Composable
-internal fun ResponseControls(status: StatusState, a: AnswerUi, vm: MainViewModel) {
+internal fun ResponseControls(enabled: Boolean, status: StatusState, a: AnswerUi, vm: MainViewModel) {
     val c = LocalContext.current
     val text = status.mode == ResponseMode.AUTO_TEXT
     var permissionProblem by rememberSaveable { mutableStateOf(false) }
@@ -24,17 +24,21 @@ internal fun ResponseControls(status: StatusState, a: AnswerUi, vm: MainViewMode
         permissionProblem = !AutoText.allowed(c)
         if (!permissionProblem) vm.answer.selectAutoText(true)
     }
-    Text("When I miss a call", fontWeight = FontWeight.SemiBold)
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text("Enable IPick", Modifier.weight(1f), fontWeight = FontWeight.SemiBold)
+        Switch(checked = enabled, onCheckedChange = vm::setEnabled)
+    }
+    Text("Respond with", fontWeight = FontWeight.SemiBold)
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         FilterChip(!text, { vm.answer.selectAutoText(false) }, { Text("Voicemail") })
         FilterChip(text, {
             if (AutoText.allowed(c)) vm.answer.selectAutoText(true) else request.launch(AutoText.permissions)
-        }, { Text("Auto-text") }, enabled = a.test == null)
+        }, { Text("SMS") })
     }
-    Text("Auto-text sends a reply from the ringing SIM, then declines the call once the SMS is sent. Your carrier’s SMS rates apply.",
+    if (text) Text("Sends a reply from the SIM that received the call, then declines it. Your carrier’s SMS rates apply.",
         style = MaterialTheme.typography.bodySmall)
     if (permissionProblem || (text && !AutoText.allowed(c))) {
-        Text("Allow phone and SMS access to use Auto-text.", color = MaterialTheme.colorScheme.error)
+        Text("Allow phone and SMS access to send replies.", color = MaterialTheme.colorScheme.error)
     }
     var menu by remember { mutableStateOf(false) }
     Box {
@@ -45,16 +49,11 @@ internal fun ResponseControls(status: StatusState, a: AnswerUi, vm: MainViewMode
             }
         }
     }
-    Text("DND starts the selected response immediately. Idle and Custom use this timer. If the call stops ringing first, there’s no response.", style = MaterialTheme.typography.bodySmall)
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text("Use 5 seconds for calls silenced by phone DND", Modifier.weight(1f))
-        Switch(a.dndShort, vm.answer::setDndShort)
-    }
     HorizontalDivider()
-    Text("Current status", fontWeight = FontWeight.SemiBold)
+    Text("Status outside DND", fontWeight = FontWeight.SemiBold)
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        Availability.entries.forEach { value ->
-            FilterChip(selected = status.status == value, onClick = {
+        listOf(Availability.IDLE, Availability.CUSTOM).forEach { value ->
+            FilterChip(selected = status.normalStatus == value, onClick = {
                 if (text && value == Availability.CUSTOM && status.custom.isBlank()) vm.showScreen(Screen.CUSTOM_REPLY)
                 else StatusRepository.choose(c, value)
             }, label = { Text(value.title) })
@@ -66,11 +65,7 @@ internal fun ResponseControls(status: StatusState, a: AnswerUi, vm: MainViewMode
         TextButton(onClick = { vm.showScreen(Screen.ANSWERING_MACHINE) }) { Text("Edit text replies in Greetings") }
         status.lastFailure?.let { Text(it, color = MaterialTheme.colorScheme.error) }
     } else {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Take voicemail messages", Modifier.weight(1f))
-            Switch(a.enabled, vm.answer::setEnabled, enabled = a.enabled || a.blocked == null)
-        }
-        a.blocked?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+        if (enabled) a.blocked?.let { Text(it, color = MaterialTheme.colorScheme.error) }
         TextButton(onClick = { vm.showScreen(Screen.ANSWERING_MACHINE) }) { Text("Manage greetings") }
     }
 }
@@ -86,12 +81,12 @@ internal fun StatusPage(modifier: Modifier, status: StatusState, edit: Boolean, 
             LaunchedEffect(Unit) { vm.showScreen(Screen.ANSWERING_MACHINE) }
         } else {
             Text("Your status chooses the voicemail greeting or SMS reply used for missed calls.")
-            Availability.entries.forEach { value ->
+            listOf(Availability.IDLE, Availability.CUSTOM).forEach { value ->
                 Row(modifier = Modifier.fillMaxWidth().clickable {
                     if (status.mode == ResponseMode.AUTO_TEXT && value == Availability.CUSTOM && status.custom.isBlank()) vm.showScreen(Screen.CUSTOM_REPLY)
                     else StatusRepository.choose(c, value)
                 }.padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                    RadioButton(selected = status.status == value, onClick = null)
+                    RadioButton(selected = status.normalStatus == value, onClick = null)
                     Column(Modifier.padding(start = 16.dp)) {
                         Text(value.title, fontWeight = FontWeight.SemiBold)
                         Text(if (status.mode == ResponseMode.VOICEMAIL) "${value.title} voicemail greeting" else status.replyFor(value))

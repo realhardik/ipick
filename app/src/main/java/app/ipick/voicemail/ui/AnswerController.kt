@@ -15,6 +15,7 @@ import app.ipick.voicemail.calls.CallTracking
 import app.ipick.voicemail.answering.EmergencyPause
 import app.ipick.voicemail.capture.CaptureDaemon
 import app.ipick.voicemail.answering.Greeting
+import app.ipick.voicemail.answering.GreetingCue
 import app.ipick.voicemail.answering.GreetingPreferences
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -39,7 +40,6 @@ data class AnswerUi(
     val editing: Availability = Availability.IDLE,
     val enabled: Boolean = false,
     val delay: Int = AnsweringMachine.DEFAULT_DELAY,
-    val dndShort: Boolean = true,
     val screenOff: Boolean = false,
     val longest: Int = AnsweringMachine.DEFAULT_LONGEST,
     val sim: String = AnsweringMachine.SIM_DEFAULT,
@@ -72,7 +72,7 @@ data class AnswerUi(
     /** Why the switch cannot be turned on, or null when it can. */
     val blocked: String?
         get() = when {
-            stageOne == null -> "Run the checks below first"
+            stageOne == null -> "Check phone compatibility in Settings → Voicemail audio."
             !stageOne.possible -> stageOne.problem
             !callTracking -> "Needs exact call tracking, in Settings"
             greetingSeconds == null -> "Record a greeting first"
@@ -113,7 +113,6 @@ class AnswerController(
             it.copy(
                 enabled = AnsweringMachine.enabled(app),
                 delay = AnsweringMachine.delay(app),
-                dndShort = AnsweringMachine.dndShort(app),
                 screenOff = AnsweringMachine.screenOff(app),
                 longest = AnsweringMachine.longest(app),
                 sim = AnsweringMachine.sim(app),
@@ -156,39 +155,16 @@ class AnswerController(
         _state.update { it.copy(pausedUntil = null) }
     }
 
-    private var switchingMode: Job? = null
-
     fun selectAutoText(on: Boolean) {
-        if (switchingMode?.isActive == true || on == StatusRepository.autoText(app)) return
-        if (on && !AutoText.allowed(app)) return
-        switchingMode = scope.launch {
-            // Disarm any pending answer (including diagnostics) before allowing SMS.
-            if (on && !CaptureDaemon.setAnswering(app, "text")) {
-                say("Reconnect the voicemail helper to activate Auto-text.")
-                return@launch
-            }
-            StatusRepository.setAutoText(app, on)
-            reload()
-            if (!on) push()
-        }
-    }
-
-    fun setEnabled(on: Boolean) {
-        if (StatusRepository.autoText(app)) return
-        if (on && _state.value.blocked != null) return
-        AnsweringMachine.setEnabled(app, on)
-        _state.update { it.copy(enabled = on) }
-        push()
+        if (on == StatusRepository.autoText(app) || (on && !AutoText.allowed(app))) return
+        StatusRepository.setAutoText(app, on)
+        reload()
+        scope.launch { CaptureDaemon.setAnswering(app) }
     }
 
     fun setDelay(seconds: Int) {
         AnsweringMachine.setDelay(app, seconds)
         _state.update { it.copy(delay = seconds) }
-    }
-
-    fun setDndShort(short: Boolean) {
-        AnsweringMachine.setDndShort(app, short)
-        _state.update { it.copy(dndShort = short) }
     }
 
     fun setScreenOff(on: Boolean) {
@@ -343,7 +319,7 @@ class AnswerController(
         previewJob?.cancel()
         previewJob = scope.launch {
             val status = _state.value.editing
-            val pcm = withContext(Dispatchers.IO) { Greeting.read(app, status) }
+            val pcm = withContext(Dispatchers.IO) { GreetingCue.appendTo(Greeting.read(app, status)) }
             if (_state.value.editing != status) return@launch
             val track = Greeting.preview(pcm) ?: return@launch
             preview = track
@@ -364,8 +340,7 @@ class AnswerController(
     fun deleteGreeting() {
         stopPreview()
         Greeting.delete(app)
-        AnsweringMachine.setEnabled(app, false)
-        _state.update { it.copy(greetingSeconds = null, enabled = false) }
+        _state.update { it.copy(greetingSeconds = null) }
         scope.launch {
             CaptureDaemon.syncGreeting(app)
             CaptureDaemon.setAnswering(app)
@@ -400,7 +375,7 @@ class AnswerController(
      * the greeting, and measures.
      */
     fun startTest(incoming: Boolean, number: String = "") {
-        if (StatusRepository.autoText(app) || _state.value.generating || _state.value.savingGreeting || _state.value.recordingTake) return
+        if (!AnsweringMachine.enabled(app) || _state.value.generating || _state.value.savingGreeting || _state.value.recordingTake) return
         // A test answers whoever calls in its three minutes: never in the day
         // after an emergency call, when that may be them calling back. Nor is
         // an emergency number ever called for one (the screen says so too).
@@ -416,7 +391,7 @@ class AnswerController(
             // The test plays the greeting the recorder has, on the route the
             // recorder has: both brought up to date first.
             if (!CaptureDaemon.syncGreeting(app)) { say("Could not load the current greeting"); return@launch }
-            CaptureDaemon.setAnswering(app)
+            if (!CaptureDaemon.setAnswering(app) || !AnsweringMachine.enabled(app)) return@launch
             val reply = CaptureDaemon.armTest(app, incoming, number)
             if (reply != "TEST armed") {
                 say(

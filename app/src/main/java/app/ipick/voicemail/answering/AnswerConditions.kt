@@ -19,25 +19,6 @@ internal object AnswerConditions {
     private const val KEY_SIM_COUNT = "answer_sim_count"
 
     /**
-     * Would Do Not Disturb silence a call from [handle]? Off: no. On: Android
-     * says, per caller (NotificationManager.matchesCallFilter, Android 13+,
-     * with contacts access or this app's notification listener) - so a
-     * starred contact a "starred only" DND lets through rings for the full
-     * delay. Where it cannot say, DND on counts as silencing: the cost is an
-     * earlier answer for a caller DND would have let ring.
-     *
-     * Measured on an Honor, 2026-10-22: DND off, a call rings; DND set to
-     * starred contacts, a non-starred contact and an unknown number were both
-     * silenced.
-     */
-    fun dndSilences(context: Context, handle: Uri?): Boolean {
-        val notifications = context.getSystemService(NotificationManager::class.java) ?: return false
-        if (notifications.currentInterruptionFilter == NotificationManager.INTERRUPTION_FILTER_ALL) return false
-        if (handle == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return true
-        return runCatching { !notifications.matchesCallFilter(handle) }.getOrDefault(true)
-    }
-
-    /**
      * Whether a call on phone account [account] is one to answer, by the
      * user's "Answer on" choice. With one SIM - or an account Telecom did not
      * name - always: the choice only exists with two.

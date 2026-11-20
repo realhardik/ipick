@@ -3,6 +3,7 @@ package app.ipick.voicemail.ui
 import androidx.annotation.RequiresApi
 import android.os.Build
 import android.app.StatusBarManager
+import app.ipick.voicemail.response.StatusRepository
 import android.app.Application
 import android.util.Log
 import androidx.core.content.edit
@@ -236,7 +237,7 @@ data class UiState(
     val canReadAudio: Boolean = false,
     val offerCallLog: Boolean = false,
     /** Whether IPick is switched on at all. */
-    val enabled: Boolean = true,
+    val enabled: Boolean = false,
     /** What turning IPick off switches off besides: Settings, When IPick
      *  is off (DebugSwitchesOff). */
     val offMode: OffMode = OffMode.KEEP_DEBUGGING,
@@ -393,7 +394,8 @@ class MainViewModel @JvmOverloads constructor(
         // last reading of the recorder is from before it went, and said
         // "Ready" six seconds before the recorder was back (the Honor,
         // 2026-10-26). A flip from this screen is handled by setEnabled.
-        if (on && !was) awaitRecorderStartedElsewhere()
+        answer.reload()
+        if (on && !was && !StatusRepository.autoText(app)) awaitRecorderStartedElsewhere()
     }
 
     /** What went off with the switch, as it changes - from the tile too. */
@@ -613,6 +615,7 @@ class MainViewModel @JvmOverloads constructor(
         _state.update {
             it.copy(
                 step = step,
+                finishFailed = if (step == SetupStep.NEEDS_CONNECTION) AdbTransport.lastWirelessError else it.finishFailed,
                 pairingLost = it.pairingLost && step != SetupStep.READY,
                 backgroundLabel = background?.label,
                 backgroundInstruction = background?.instruction,
@@ -667,6 +670,12 @@ class MainViewModel @JvmOverloads constructor(
      *  than at the keep-alive's next turn, and allowed to switch Wireless
      *  debugging off and on again for an adbd still stopped. */
     fun startAgain() = reviveIfDown(CaptureDaemon.Request.USER)
+
+    fun openConnectionSetup() = launchActionWhenFree("open connection setup") {
+        Setup.reopenConnection(getApplication())
+        _state.update { it.copy(step = SetupStep.CHECKING, screen = Screen.HOME, finishFailed = null) }
+        recheckSetup()
+    }
 
     private fun reviveIfDown(request: CaptureDaemon.Request) {
         val s = _state.value
@@ -774,15 +783,29 @@ class MainViewModel @JvmOverloads constructor(
      * screen with Wireless debugging up. We are already paired, so a connect that
      * lands lets recheckSetup finish setup outright.
      */
-    fun reconnect() = launchAction("connect") {
+    fun reconnect(port: Int? = null) = launchAction("connect") {
         val app = getApplication<Application>()
+        _state.update { it.copy(finishFailed = null) }
+        if (port != null) {
+            val result = AdbTransport.connectWireless(app, port)
+            if (result.isSuccess) recheckSetup()
+            else _state.update { it.copy(finishFailed = result.exceptionOrNull()?.localizedMessage ?: "Connection failed.") }
+            return@launchAction
+        }
+        var failure: Throwable? = null
         repeat(6) {
-            if (AdbTransport.autoConnect(app, timeoutMs = 6_000).isSuccess) {
+            val result = AdbTransport.autoConnect(app, timeoutMs = 6_000)
+            failure = result.exceptionOrNull()
+            if (result.isSuccess) {
                 recheckSetup()
                 return@launchAction
             }
+            if (AdbTransport.lastConnect == AdbTransport.ConnectOutcome.REFUSED) {
+                _state.update { it.copy(finishFailed = failure?.localizedMessage) }
+                return@launchAction
+            }
         }
-        recheckSetup()
+        _state.update { it.copy(finishFailed = failure?.localizedMessage) }
     }
 
     private suspend fun finishSetupInternal() {
@@ -858,12 +881,6 @@ class MainViewModel @JvmOverloads constructor(
      * over (OffMode.asksFirst). Everything else goes straight to [setEnabled].
      */
     fun toggleRecording(on: Boolean) {
-        // The port's reading the screen shows ("Back on: anywhere"), so the
-        // question and the screen agree - and no getprop on the main thread.
-        if (!on && DebugSwitchesOff.asksBeforeOff(getApplication()) { _state.value.portSet }) {
-            _state.update { it.copy(askingToTurnOff = true) }
-            return
-        }
         setEnabled(on)
     }
 
@@ -940,41 +957,7 @@ class MainViewModel @JvmOverloads constructor(
      * Wi-Fi - and stranded an "off" in the field until the next network.
      */
     fun setEnabled(on: Boolean) {
-        // `starting` matters as much as `enabled` here. The switch flips at
-        // once, but the recorder takes a couple of seconds to come up, and in
-        // between the screen still held the reading from when it was off - so
-        // it announced in red that the phone could not record and needed Wi-Fi,
-        // while the recorder was starting normally. An error shown for a normal
-        // operation in progress is how people learn to ignore errors. And
-        // shown before the switch is saved, so the switch's own listener
-        // (stopWatchingSwitch) takes this flip for this screen's, not the
-        // tile's.
-        if (on) starts.begin()
-        _state.update { it.copy(enabled = on) }
-        // Saved at once, outside the action below, which waits its turn.
-        RecorderSwitch.set(getApplication(), on)
-        // Waits its turn rather than being dropped: the record control takes
-        // a tap while the app is busy - each opening's check holds busy for
-        // seconds - and the tap was dropped without a sign, the control
-        // looking as ever. The control flips at once; the recorder follows
-        // when the app is free, as the switch then is - a quick on and off
-        // ends off.
-        launchActionWhenFree(if (on) "turn on" else "turn off") {
-            try {
-                if (RecorderSwitch.isOn(getApplication()) != on) return@launchActionWhenFree
-                // Shared with the Quick Settings tile. See RecorderSwitch.turn.
-                RecorderSwitch.turn(getApplication(), on)
-                // Ask what the world looks like rather than assuming. Called
-                // directly, not via refreshSetup(), because that is a launchAction
-                // and one will not start while this one is running.
-                recheckSetup()
-            } finally {
-                // Whatever happened: "Starting..." outranks "Ready" in the
-                // header, and left set it stays there with the recorder up -
-                // unless another start is still under way (startingEnded).
-                if (on) starts.end()
-            }
-        }
+        RecorderSwitch.turnInBackground(getApplication(), on)
     }
 
     /**
@@ -1264,13 +1247,6 @@ class MainViewModel @JvmOverloads constructor(
         val app = getApplication<Application>()
         CallTracking.setEnabled(app, on)
         _state.update { it.copy(callTracking = on) }
-        // The answering machine answers on tracking's word alone: left on
-        // without it, it would say it answers and never would. Settings asks
-        // before this (SettingsDialog.TRACKING_OFF).
-        if (!on && (answer.state.value.enabled || AnsweringMachine.enabled(app))) {
-            answer.setEnabled(false)
-            say("the answering machine is off too: it needs exact call tracking")
-        }
         answer.reload()
         viewModelScope.launch {
             if (!CaptureDaemon.setTracking(app)) {
@@ -1406,7 +1382,6 @@ class MainViewModel @JvmOverloads constructor(
                 automatic = RecordingMode.of(app) == RecordingMode.AUTOMATIC,
                 debugNotificationHidden = DebugNotificationCleaner.hiding(app),
                 afterCallNotice = AfterCall.enabled(app),
-                enabled = RecorderSwitch.isOn(app),
                 offMode = DebugSwitchesOff.mode(app),
                 debuggingOff = DebugSwitchesOff.recorderGone(app),
                 startWithoutWifi = StartWithoutWifi.enabled(app),
@@ -1467,7 +1442,7 @@ class MainViewModel @JvmOverloads constructor(
                 automatic = snapshot.automatic,
                 debugNotificationHidden = snapshot.debugNotificationHidden,
                 afterCallNotice = snapshot.afterCallNotice,
-                enabled = snapshot.enabled,
+                enabled = RecorderSwitch.isOn(app),
                 offMode = snapshot.offMode,
                 debuggingOff = snapshot.debuggingOff,
                 startWithoutWifi = snapshot.startWithoutWifi,
@@ -1609,7 +1584,6 @@ class MainViewModel @JvmOverloads constructor(
         val automatic: Boolean,
         val debugNotificationHidden: Boolean,
         val afterCallNotice: Boolean,
-        val enabled: Boolean,
         val offMode: OffMode,
         val debuggingOff: Boolean,
         val startWithoutWifi: Boolean,

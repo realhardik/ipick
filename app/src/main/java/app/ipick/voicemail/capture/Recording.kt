@@ -187,17 +187,20 @@ internal object Recordings {
     internal fun withCallers(context: Context, recordings: List<Recording>): List<Recording> {
         val callers = CallLogLookup.labelsFor(context, recordings)
         val noted = if (recordings.any { it.parsedName?.app != null }) FileNames.callers(context) else emptyMap()
+        val contacts = mutableMapOf<String, CallLogLookup.Contact>()
         val named = recordings.map { recording ->
             val caller = callers[recording.name]
+            val received = if (recording.message) MessageMarks.number(context, recording.name) else null
+            val contact = received?.let { CallLogLookup.contactFor(context, it, contacts) }
             val fromName = recording.parsedName
             // A messenger call is never in the call log: who it was comes
             // from its name, or from what was noted when it was saved, or it
             // is simply that app's call.
             val messenger = recording.app?.let { app -> noted[recording.name] ?: "$app call" }
             recording.copy(
-                caller = caller?.label ?: fromName?.caller ?: fromName?.number ?: messenger,
+                caller = contact?.name ?: (caller?.label?.takeIf { CallLogLookup.photosGranted(context) }) ?: received ?: caller?.label ?: fromName?.caller ?: fromName?.number ?: messenger,
                 callerPhoto = caller?.photo,
-                number = caller?.number ?: fromName?.number,
+                number = received ?: caller?.number ?: fromName?.number,
                 callerFavorite = caller?.favorite ?: false,
             )
         }

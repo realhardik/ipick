@@ -2,36 +2,8 @@ package app.ipick.voicemail.ui
 
 import app.ipick.voicemail.capture.SystemProperty
 
-/**
- * Whether setup's `pm grant` gave IPick WRITE_SECURE_SETTINGS, and when it
- * did not, what the user can do about it.
- *
- * OPPO, OnePlus AND REALME PHONES REFUSE IT OUT OF THE BOX. Their system
- * (ColorOS, OxygenOS, realme UI) takes a list of permissions away from the
- * shell - the user an ADB session runs as - while the property
- * persist.sys.permission.enable is "true", which is how they ship. With it,
- * `pm grant` answers "Neither user 2000 nor current process has
- * android.permission.GRANT_RUNTIME_PERMISSIONS": issue #64 (Nord CE5,
- * OxygenOS 16, 2026-10-29) quoted it, and issue #61 (OnePlus 10R, Android 15,
- * 2026-10-28) got the Xiaomi advice this used to give everyone. No OnePlus
- * here; the rest is CallVault's, measured on a OnePlus 9 (OxygenOS 14) and a
- * OnePlus 12 (OxygenOS 16) on 2026-09-16: the property is "false" once the
- * Developer options switch is on, `pm grant`, `appops set` and `settings put`
- * from the shell all fail while it is "true", and a grant made earlier
- * outlives the switch going off again, and a restart.
- *
- * The switch is the last one in Developer options' Apps section: "Disable
- * system optimization" on ColorOS and OxygenOS 15 and 16, "Disable permission
- * monitoring" before. Some builds show it only in English (Shizuku issues
- * #374 and #2149, reported 2026-06 and 2026-07); CallVault saw it in Hebrew
- * on OxygenOS 16.1. Nothing an app or the shell can do gets past it while it
- * is off: the shell's own writes are refused too.
- *
- * WHETHER IT WAS GRANTED IS READ BACK, not taken from `pm grant` saying
- * nothing: a Xiaomi on HyperOS 3 was reported to CallVault as printing
- * nothing and granting nothing. This process cannot ask for itself - a
- * granted permission reaches it only once it restarts (Setup.isComplete) -
- * so the shell reads the package's record with dumpsys.
+/** Some Android builds restrict shell grants through Developer options.
+ * Read back the package's permissions because a grant command can return silently on failure.
  */
 internal object ShellGrant {
 
@@ -146,11 +118,8 @@ internal object ShellGrant {
             monitoring == true || (monitoring == null && skin == DeviceSkin.OPLUS) ->
                 "This phone needs one more switch on first. In Developer options, turn on $SWITCH. " +
                     "Then tap Try again, and leave it that way afterwards."
-            // The switch is on and the grant still did not take. A restart is
-            // a guess, unmeasured: what else could hold the old answer.
             monitoring == false ->
-                "The switch for it in Developer options is already set, so restart the phone, " +
-                    "then open IPick on Wi-Fi and tap Try again."
+                "The Developer options switch is already set. Keep Wireless debugging on and tap Try again."
             skin == DeviceSkin.XIAOMI ->
                 "Turn on \"USB debugging (Security settings)\" in Developer options, then tap Try again."
             else ->

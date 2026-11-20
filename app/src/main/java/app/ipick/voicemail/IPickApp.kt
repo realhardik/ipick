@@ -1,6 +1,6 @@
 package app.ipick.voicemail
 
-import app.ipick.voicemail.response.StatusNotification
+import android.app.NotificationManager
 import android.app.Application
 import android.util.Log
 import app.ipick.voicemail.capture.BackgroundKill
@@ -22,7 +22,10 @@ class IPickApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
-        StatusNotification.start(this)
+        app.ipick.voicemail.capture.RecorderSwitch.migrate(this)
+        val notifications = getSystemService(NotificationManager::class.java)
+        notifications.deleteNotificationChannel("ipick.status")
+        notifications.deleteNotificationChannel("ipick.response-indicator")
         // Off the main thread: binder calls, and a call's wake may be what
         // started this process.
         val app = this

@@ -66,6 +66,7 @@ object CallTracking {
          *  call's clock (PacketClock). Null for a call tracked before it
          *  was kept. */
         val clockOffset: Long? = null,
+        val messageNumber: String? = null,
     ) {
         val answered: Boolean get() = activations.isNotEmpty()
         val answeredAt: Long get() = activations.firstOrNull() ?: 0L
@@ -108,12 +109,13 @@ object CallTracking {
         t.activations.joinToString(","),
         t.endedAt.toString(),
         t.clockOffset?.toString() ?: "",
+        t.messageNumber.orEmpty(),
     ).joinToString(SEP.toString())
 
     /** Five fields as kept before the clock offset was, six since. */
     internal fun decode(s: String): Tracked? {
         val p = s.split(SEP)
-        if (p.size != 5 && p.size != 6) return null
+        if (p.size !in 5..7) return null
         return Tracked(
             id = p[0].toLongOrNull() ?: return null,
             incoming = p[1] == "in",
@@ -121,6 +123,7 @@ object CallTracking {
             activations = p[3].split(',').mapNotNull { it.toLongOrNull() },
             endedAt = p[4].toLongOrNull() ?: return null,
             clockOffset = p.getOrNull(5)?.toLongOrNull(),
+            messageNumber = p.getOrNull(6)?.ifEmpty { null },
         )
     }
 

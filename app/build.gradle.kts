@@ -25,14 +25,7 @@ android {
     // two happening to share the number 36 today is a coincidence.
     compileSdk = 37
 
-    // Pinned because shellserver/build.sh reads d8 out of build-tools/36.0.0 by
-    // path, and until now that worked only because 36.0.0 happens to be AGP's
-    // default. Nothing declared it, so nothing would have caught AGP moving on:
-    // the daemon build would fail on a machine that had never been told which
-    // build-tools to install - F-Droid's, for one, which installs only what the
-    // Gradle build asks for plus what its metadata names. Stating it here makes
-    // AGP install the version build.sh expects. Keep the two in step; build.sh
-    // takes BUILD_TOOLS from the environment, so it can be told otherwise.
+    // Keep this version in sync with the d8 invocation in shellserver/build.sh.
     buildToolsVersion = "36.1.0"
 
     defaultConfig {
@@ -40,11 +33,6 @@ android {
         minSdk = 31
         targetSdk = 36
 
-        // From gradle.properties, which is the one place the version is
-        // written - see the comment there. property() rather than
-        // findProperty() so a missing key fails with its name instead of
-        // shipping a fallback: a fallback here once meant every release
-        // would have been versionCode 1.
         versionCode = (property("ipickVersionCode") as String).toInt()
         versionName = property("ipickVersionName") as String
     }
@@ -64,14 +52,7 @@ android {
 
     buildTypes {
         release {
-            // R8, on. Measured on 0.4 before this: 38 MB on disk, of which
-            // 28.5 MB was dex and 0.2 MB of that was this app - the rest was
-            // libraries shipped whole, and 12.8 MB was nothing but the names
-            // of their classes, methods and fields. proguard-rules.pro says
-            // what has to survive and why. Debug stays unshrunk: its
-            // diagnostic receivers are reached by name from tools/, and a
-            // build that takes a minute longer is a measurement that does
-            // not get made.
+            isDebuggable = false
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
@@ -84,6 +65,7 @@ android {
             if (signingReady) signingConfig = signingConfigs.getByName("release")
         }
         debug {
+            isDebuggable = providers.gradleProperty("developmentDebug").orNull == "true"
             // Coverage of the unit and screen tests, only when asked for:
             // ./gradlew createDebugUnitTestCoverageReport -Pcoverage. A report
             // to read, not a gate, and JaCoCo slows every test it watches -
@@ -91,21 +73,7 @@ android {
             // carry none of it.
             enableUnitTestCoverage = providers.gradleProperty("coverage").isPresent
         }
-        // The debug build through R8 with the release's rules, for the
-        // emulator checks (tools/emulator_checks.py installs this one).
-        // Until 0.25.3 they installed debug, which is not shrunk, so nothing
-        // ever ran what R8 makes: a library rule that let R8 remove a
-        // constructor WorkManager reflects on failed every one-time work in
-        // every release from 0.5 to 0.25.2, and no check could see it (issue
-        // #69). This keeps debug's diagnostic receiver, which the checks
-        // drive, and debug's key.
-        //
-        // Not debuggable, unlike debug: AGP runs R8 in its debug mode for a
-        // debuggable build, which removes what the same rules let go but
-        // optimises far less. Measured 2026-10-31: debuggable, R8 removed
-        // 49,827 items to the release's 70,575 and left 35 classes without a
-        // constructor to the release's 725. The checks read the app's files
-        // as root instead of with run-as.
+        // Use release optimizations with the local signing key for device checks.
         create("shrunk") {
             initWith(getByName("debug"))
             isDebuggable = false
@@ -207,23 +175,10 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.11.0")
     implementation("androidx.core:core-ktx:1.19.0")
 
-    // Playing a recording with the screen off: a media session in a service,
-    // Android's documented route, under the system's media controls. The
-    // session alone, not ExoPlayer: recordings still play with MediaPlayer
-    // (capture/SessionPlayer.kt). Measured on the release APK, 2026-10-23:
-    // 9.19 MB -> 9.75 MB with it; ExoPlayer as well would have made 10.73.
+    // Android media controls for background voicemail playback.
     implementation("androidx.media3:media3-session:1.11.1")
 
-    // Keeps the shell-side recorder alive without a permanent foreground
-    // service: a periodic job revives it when it is down and Wi-Fi is around.
-    //
-    // 2.10 is the floor. 2.9.1's keep rule for input mergers had no member
-    // clause, so R8 kept OverwritingInputMerger and removed the constructor
-    // WorkManager reflects on for every one-time work: in every shrunk
-    // release from 0.5 to 0.25.2, each kick of the keep-alive and every USB
-    // debugging watch ended FAILED without running (issue #69). 2.10 ships
-    // the rule with the constructor. 2.12 also brings Room 2.7, whose own
-    // rule keeps WorkDatabase_Impl's constructor the same way.
+    // WorkManager schedules helper recovery and observes USB debugging changes.
     implementation("androidx.work:work-runtime-ktx:2.12.0")
 
     // Compose's own pitfalls, which Android Lint does not know: Slack's rules
@@ -250,6 +205,7 @@ val buildShellServer = tasks.register<Exec>("buildShellServer") {
     workingDir = shellServerDir
     commandLine("./build.sh")
     inputs.dir(File(shellServerDir, "src"))
+    inputs.file(file("src/main/java/app/ipick/voicemail/answering/GreetingCue.java"))
     inputs.file(File(shellServerDir, "build.sh"))
     outputs.file(shellServerJar)
 }

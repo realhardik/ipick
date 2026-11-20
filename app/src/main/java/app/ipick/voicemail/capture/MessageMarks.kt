@@ -25,7 +25,14 @@ object MessageMarks {
     fun all(context: Context): Set<String> =
         Prefs.of(context).getStringSet(KEY, emptySet())?.toSet() ?: emptySet()
 
-    fun mark(context: Context, name: String) = mark(context, listOf(name))
+    private const val NUMBER_PREFIX = "voicemail.caller."
+    fun number(context: Context, name: String): String? = Prefs.of(context).getString(NUMBER_PREFIX + name, null)
+
+    @Synchronized
+    fun mark(context: Context, name: String, number: String? = null) {
+        if (number != null) Prefs.of(context).edit { putString(NUMBER_PREFIX + name, number) }
+        mark(context, listOf(name))
+    }
 
     @Synchronized
     fun mark(context: Context, names: Collection<String>) {
@@ -38,6 +45,9 @@ object MessageMarks {
             marks.associateWith { FileNames.parse(it)?.startedAt ?: 0L }
                 .entries.sortedByDescending { it.value }.take(KEEP).map { it.key }.toSet()
         }
-        Prefs.of(context).edit { putStringSet(KEY, kept) }
+        Prefs.of(context).edit {
+            putStringSet(KEY, kept)
+            (marks - kept).forEach { remove(NUMBER_PREFIX + it) }
+        }
     }
 }

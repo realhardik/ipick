@@ -92,7 +92,7 @@ public final class ActivityManager {
         }
     }
 
-    void removeContentProviderExternal(String name, IBinder token) {
+    public void removeContentProviderExternal(String name, IBinder token) {
         try {
             Method method = getRemoveContentProviderExternalMethod();
             method.invoke(manager, name, token);

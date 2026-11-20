@@ -14,8 +14,15 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -61,7 +68,12 @@ fun SetupScreen(state: UiState, vm: MainViewModel, modifier: Modifier = Modifier
     // Whatever the user chooses, re-derive the step from what is actually
     // granted rather than from the result callback - "denied" and "denied
     // permanently" need different words, and only the real state knows.
-    val permissionLauncher = rememberPermissionRequest { vm.refreshSetup() }
+    val permissionLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        Setup.callerAccessAsked(context)
+        vm.refreshSetup()
+    }
 
     Column(modifier, verticalArrangement = Arrangement.spacedBy(16.dp)) {
 
@@ -75,7 +87,7 @@ fun SetupScreen(state: UiState, vm: MainViewModel, modifier: Modifier = Modifier
         // title - setup has no app bar of its own, but its heading should not be
         // a size the rest of the app never uses.
         Text(
-            if (askingAfterSetup) "One question" else "Set up voicemail",
+            if (askingAfterSetup) "One question" else "Set up IPick",
             style = MaterialTheme.typography.headlineLarge,
         )
         Text(
@@ -128,7 +140,7 @@ fun SetupScreen(state: UiState, vm: MainViewModel, modifier: Modifier = Modifier
                     // true the moment audio access joined them, and is a
                     // different number again on an older Android.
                     Text(
-                        "Tap Allow below, then Allow to each question Android asks.",
+                        "Allow phone and contacts access to identify voicemail callers. If you skip it, IPick shows the number when Android shares it.",
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     Text(
@@ -140,6 +152,11 @@ fun SetupScreen(state: UiState, vm: MainViewModel, modifier: Modifier = Modifier
                         onClick = { haptics.tap(); permissionLauncher.launch(Setup.ASK_PERMISSIONS) },
                         enabled = !state.busy,
                     ) { Text("Allow") }
+                    if (Setup.missingRuntimePermissions(context).isEmpty()) {
+                        TextButton(onClick = { Setup.callerAccessAsked(context); vm.refreshSetup() }) { Text("Skip") }
+                    } else if (android.os.Build.VERSION.SDK_INT >= 33) {
+                        TextButton(onClick = { openAppSettings(context) }) { Text("Open app permissions") }
+                    }
 
                 }
             }
@@ -507,6 +524,18 @@ fun SetupScreen(state: UiState, vm: MainViewModel, modifier: Modifier = Modifier
                             enabled = !state.busy,
                         ) { Text("Try again") }
                     }
+                    state.finishFailed?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                    var portText by rememberSaveable { mutableStateOf("") }
+                    Text("To connect directly, open Android’s Wireless debugging screen and copy the number after the colon under IP address & port.")
+                    OutlinedTextField(value = portText, onValueChange = { value ->
+                        if (value.length <= 5 && value.all { it in '0'..'9' }) portText = value
+                    }, label = { Text("Connection port") }, singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number))
+                    val port = portText.toIntOrNull()?.takeIf { it in 1..65535 }
+                    FilledTonalButton(onClick = { port?.let { vm.reconnect(it) } }, enabled = port != null && !state.busy) {
+                        Text("Connect to this phone")
+                    }
+                    TextButton(onClick = vm::pairAgain, enabled = !state.busy) { Text("Pair again") }
                 }
             }
 

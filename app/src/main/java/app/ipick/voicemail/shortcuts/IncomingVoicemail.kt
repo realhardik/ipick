@@ -4,13 +4,11 @@ import android.app.*
 import android.content.*
 import app.ipick.voicemail.R
 
-/** Main-thread registry shared by the key shortcut and the immutable notification action. */
 object IncomingVoicemail {
     private const val ID = 4710
     private const val CHANNEL = "ipick.incoming-action"
     private var token: String? = null
     private var action: (() -> Unit)? = null
-    fun currentToken() = token
 
     fun show(c: Context, id: String, send: () -> Unit) {
         token = id

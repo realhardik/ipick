@@ -754,7 +754,10 @@ object RecordingSaver {
             )
             if (phoneCall) FileNames.noteDirection(context, o.part.name, o.part.incoming)
             published += o.part to seconds.toInt()
-            if (message) MessageMarks.mark(context, o.part.name)
+            if (message) {
+                val tracked = CallTracking.callsIn(CallTracking.calls(context), o.part.startMillis, true)
+                MessageMarks.mark(context, o.part.name, tracked.firstOrNull()?.messageNumber)
+            }
             _saved.tryEmit(o.part.name)
             last = Outcome.Saved(
                 o.part.name, seconds, o.target.uri, o.target.filePath, o.part.incoming, o.part.startMillis,

@@ -109,16 +109,7 @@ internal fun chipsFor(items: List<ChipFacts>, on: Set<ListChip>): List<ListChip>
     return chips
 }
 
-/**
- * The chips [on] as the questions they ask, a list for each kind - search
- * left out, being the query's. Each kind is its own question - who the call
- * was with, how it came, what was kept - so kinds combine: each ANDs on top
- * of the others. Chips of one kind widen: WhatsApp and Telegram and
- * favourites is favourites' calls on either app. Sources were one at a time
- * once, copied from the time presets, where picking one replaced the other;
- * a call comes one way only, so a second source can only widen (the user
- * asked why they excluded each other, 2026-10-23).
- */
+/** A recording must match one selected chip from each active filter category. */
 private fun questions(on: Set<ListChip>): Collection<List<ListChip>> =
     on.filter { it.kind != ChipKind.SEARCH }.groupBy { it.kind }.values
 

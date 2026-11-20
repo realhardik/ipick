@@ -20,7 +20,7 @@ internal fun AudioSettings(a: AnswerUi, autoText: Boolean, vm: MainViewModel) {
         Text(a.stageOne?.problem ?: if (a.stageOne?.possible == true)
             "This phone passed the initial checks. A real call verifies the audio route." else "Check this phone’s voicemail audio.")
         TextButton(onClick = ctl::runChecks, enabled = !a.checking) { Text(if (a.checking) "Checking…" else "Check audio support") }
-        if (!autoText && a.stageOne?.possible == true && a.greetingSeconds != null) {
+        if (a.enabled && !autoText && a.stageOne?.possible == true && a.greetingSeconds != null) {
             OutlinedButton(onClick = { ctl.startTest(incoming = true) }, enabled = a.test == null && !a.generating && !a.savingGreeting && !a.recordingTake) {
                 Text(if (a.test == null) "Test next incoming call" else "Incoming call test · ${a.test}")
             }

@@ -168,6 +168,12 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.IPick">
 
+        <provider
+            android:name=".capture.BootstrapProvider"
+            android:authorities="${applicationId}.bootstrap"
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
+
         <!--
           The mid-call prompt's full-screen half. Opens for real only on a
           locked screen; the rest of the time the system demotes it to a
@@ -178,7 +184,6 @@
           place: it should never be something the user swipes back to later and
           answers about a call that ended an hour ago.
         -->
-        <receiver android:name=".response.StatusAction" android:exported="false" />
         <receiver android:name=".response.SmsResult" android:exported="false" />
         <activity
             android:name=".RecordPromptActivity"
@@ -280,22 +285,10 @@
             </intent-filter>
         </service>
 
-        <!--
-          Exported so the shell-side daemon can wake it with
-          `am start-foreground-service` when a call begins. That is the route
-          that lets the app be dormant between calls instead of holding a
-          permanent foreground service: iAware drops the PHONE_STATE broadcast
-          to a dead process, but a direct service start from shell is not a
-          broadcast and nothing filters it.
-
-          Exported is not open. Every intent from outside must carry a token
-          the app minted and handed to the daemon in its environment, and the
-          service does nothing without it. Its own internal actions are
-          unchanged.
-        -->
         <service
             android:name=".capture.CallMonitorService"
             android:exported="true"
+            android:permission="android.permission.DUMP"
             tools:ignore="ExportedService"
             android:foregroundServiceType="specialUse">
             <property
@@ -406,16 +399,6 @@
         </service>
 
         <receiver android:name=".shortcuts.SendToVoicemailReceiver" android:exported="false" />
-        <service
-            android:name=".shortcuts.VolumeShortcutService"
-            android:label="@string/volume_shortcut_name"
-            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="android.accessibilityservice.AccessibilityService" />
-            </intent-filter>
-            <meta-data android:name="android.accessibilityservice" android:resource="@xml/volume_shortcut_service" />
-        </service>
     </application>
 
 </manifest>

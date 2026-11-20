@@ -7,9 +7,7 @@ import app.ipick.voicemail.Prefs
 
 object AnsweringMachine {
 
-    private const val KEY_ON = "answer_on"
     private const val KEY_DELAY = "answer_delay_s"
-    private const val KEY_DND_SHORT = "answer_dnd_short"
     private const val KEY_LONGEST = "answer_longest_s"
     private const val KEY_SIM = "answer_sim"
     private const val KEY_ROUTE = "answer_route"
@@ -17,12 +15,6 @@ object AnsweringMachine {
 
     val DELAYS = listOf(5, 10, 15, 20, 25, 30)
     const val DEFAULT_DELAY = 20
-
-    /** About two rings: Do Not Disturb would silence the call anyway. */
-    const val DND_DELAY = 5
-
-    fun effectiveDelay(configured: Int, shortenForDnd: Boolean, silenced: Boolean): Int =
-        if (shortenForDnd && silenced) minOf(DND_DELAY, configured) else configured
 
     /** The longest message, in seconds; [NO_LIMIT] runs until the caller
      *  hangs up, or has been silent half a minute (the recorder's
@@ -37,11 +29,7 @@ object AnsweringMachine {
     const val SIM_DEFAULT = "default"
     const val SIM_BOTH = "both"
 
-    fun enabled(context: Context): Boolean = !StatusRepository.autoText(context) && Prefs.of(context).getBoolean(KEY_ON, false)
-
-    fun setEnabled(context: Context, on: Boolean) {
-        Prefs.of(context).edit { putBoolean(KEY_ON, on) }
-    }
+    fun enabled(context: Context) = app.ipick.voicemail.capture.RecorderSwitch.isOn(context) && !StatusRepository.autoText(context)
 
     fun delay(context: Context): Int =
         Prefs.of(context).getInt(KEY_DELAY, DEFAULT_DELAY).takeIf { it in DELAYS } ?: DEFAULT_DELAY
@@ -53,14 +41,6 @@ object AnsweringMachine {
     fun setDelay(context: Context, seconds: Int) {
         require(seconds in DELAYS)
         Prefs.of(context).edit { putInt(KEY_DELAY, seconds) }
-    }
-
-    /** With Do Not Disturb silencing the call: after about two rings (true,
-     *  the default), or the same delay as always. */
-    fun dndShort(context: Context): Boolean = Prefs.of(context).getBoolean(KEY_DND_SHORT, true)
-
-    fun setDndShort(context: Context, short: Boolean) {
-        Prefs.of(context).edit { putBoolean(KEY_DND_SHORT, short) }
     }
 
     fun longest(context: Context): Int =
@@ -115,10 +95,7 @@ object AnsweringMachine {
         /** The rules on whose calls to keep would keep this caller: true,
          *  false, or null when the caller could not be identified. */
         val rulesKeep: Boolean?,
-        /** Do Not Disturb would silence this call. */
-        val dndSilences: Boolean,
         val delay: Int,
-        val dndShort: Boolean,
         /** The call is on a SIM this answers on. */
         val simAllowed: Boolean,
         /** Another app is in a call - a messenger, VoIP, a meeting - which
@@ -154,6 +131,6 @@ object AnsweringMachine {
         !r.simAllowed -> Decision.No("not a SIM it answers on")
         r.rulesKeep == null -> Decision.No("the caller could not be identified")
         !r.rulesKeep -> Decision.No("whose calls to keep leaves this caller out")
-        else -> Decision.Answer(effectiveDelay(r.delay, r.dndShort, r.dndSilences))
+        else -> Decision.Answer(r.delay)
     }
 }

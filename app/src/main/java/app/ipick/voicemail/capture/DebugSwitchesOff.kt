@@ -156,7 +156,7 @@ object DebugSwitchesOff {
      * tile asks off the main thread.
      */
     fun asksBeforeOff(context: Context, portReady: () -> Boolean = { StartWithoutWifi.readyForUser(context) }): Boolean =
-        mode(context).asksFirst(NetworkRevive.onWifi(context), portReady)
+        mode(context).asksFirst(NetworkRevive.onWifi(context)) { StartWithoutWifi.enabled(context) && portReady() }
 
     /**
      * Switch off what the choice says. Recorded first, so a revive racing

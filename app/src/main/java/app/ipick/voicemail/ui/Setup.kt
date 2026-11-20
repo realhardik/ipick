@@ -251,6 +251,10 @@ object Setup {
             .edit { putBoolean(KEY_PAIRED, true) }
     }
 
+    fun reopenConnection(context: Context) {
+        Prefs.of(context).edit { remove(KEY_COMPLETE) }
+    }
+
     /**
      * Pair again, from the recorder-down alert: the phone advertises Wireless
      * debugging and turns this app away, which is what a forgotten pairing
@@ -311,7 +315,14 @@ object Setup {
      * tapping Allow; refused here, nothing breaks and the recordings list
      * still offers it later.
      */
-    val ASK_PERMISSIONS = RUNTIME_PERMISSIONS
+    val CALLER_PERMISSIONS = arrayOf(android.Manifest.permission.READ_PHONE_STATE,
+        android.Manifest.permission.READ_CONTACTS, android.Manifest.permission.READ_CALL_LOG)
+    val ASK_PERMISSIONS = RUNTIME_PERMISSIONS + CALLER_PERMISSIONS
+
+    fun callerAccessAsked(context: Context) {
+        Prefs.of(context).edit { putBoolean("asked_caller_access", true) }
+    }
+
 
     fun missingRuntimePermissions(context: Context): List<String> =
         RUNTIME_PERMISSIONS.filter {
@@ -439,7 +450,9 @@ object Setup {
     }
 
     private class LiveProbe(private val context: Context) : Probe {
-        override fun missingPermissions() = missingRuntimePermissions(context).isNotEmpty()
+        override fun missingPermissions() = missingRuntimePermissions(context).isNotEmpty() ||
+            (!Prefs.of(context).getBoolean("asked_caller_access", false) &&
+                CALLER_PERMISSIONS.any { context.checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED })
         override fun debuggingChoiceMade() = DebugNotificationCleaner.asked(context)
         // The preference first: once answered, no walk of the vendor screens
         // (a package-manager call each) at every return to the app.
@@ -634,14 +647,20 @@ object Setup {
                 }
                 ran to AdbTransport.exec(ShellGrant.readBackCommand(pkg, PERMISSION)).getOrNull()
             }
-            val outcome = ShellGrant.outcome(pkg, PERMISSION, grant, readBack)
+            val outcome = if (!ShellGrant.actAsRefused && context.packageManager.checkPermission(PERMISSION, pkg) ==
+                PackageManager.PERMISSION_GRANTED) ShellGrant.Outcome.GRANTED
+            else ShellGrant.outcome(pkg, PERMISSION, grant, readBack)
             // Two lines: a refusal's stack trace runs to twenty.
             Log.i(TAG, "setup: grant -> $outcome (${grant.lines().take(2).joinToString(" | ")})")
             if (outcome != ShellGrant.Outcome.GRANTED) {
                 val property = if (ShellGrant.actAsRefused) "true"
                 else AdbTransport.exec("getprop ${ShellGrant.MONITORING_PROPERTY}").getOrNull()
                 Log.i(TAG, "setup: ${ShellGrant.MONITORING_PROPERTY}=[${property?.trim()}]")
-                error(ShellGrant.advice(outcome, DeviceSkin.current(), ShellGrant.monitoring(property)))
+                val detail = grant.lineSequence().map(String::trim).firstOrNull {
+                    it.contains("SecurityException") || it.startsWith("Error:")
+                }?.take(240)
+                error(listOfNotNull(ShellGrant.advice(outcome, DeviceSkin.current(), ShellGrant.monitoring(property)), detail)
+                    .joinToString("\n"))
             }
         }
 

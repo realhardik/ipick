@@ -27,6 +27,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.launch
 import java.util.Date
 import java.util.concurrent.ConcurrentHashMap
@@ -115,8 +116,17 @@ class CallMonitorService : Service() {
      *  while the answering machine takes one (a test call, if [testing]);
      *  null otherwise. One field, read once: two that moved together could
      *  be seen half-moved from the other thread that writes them. */
+    private val messageActions = java.util.concurrent.ConcurrentHashMap<String, PendingIntent>()
     @Volatile
     private var messageTicket: String? = null
+        set(value) {
+            if (field != value) {
+                messageActions.values.forEach { it.cancel() }
+                messageActions.clear()
+            }
+            field = value
+            currentMessageSession = value
+        }
     @Volatile
     private var testing = false
 
@@ -142,6 +152,11 @@ class CallMonitorService : Service() {
     override fun onCreate() {
         super.onCreate()
         running = true
+        scope.launch(Dispatchers.Main.immediate) {
+            disconnectedMessages.collect { session ->
+                if (messageTicket == session) onCallEnded(null, true)
+            }
+        }
         createChannel()
     }
 
@@ -233,7 +248,7 @@ class CallMonitorService : Service() {
                             intent.getBooleanExtra(EXTRA_INCOMING, false),
                         )
                     }
-                    ACTION_MESSAGE_STARTED -> onMessageStarted(intent.getBooleanExtra(EXTRA_TEST, false))
+                    ACTION_MESSAGE_STARTED -> onMessageStarted(intent.getBooleanExtra(EXTRA_TEST, false), intent.getStringExtra(EXTRA_MESSAGE_SESSION))
                     ACTION_MESSAGE_TAKEN -> onMessageTaken()
                     ACTION_CABLE -> watchCable(intent.getStringExtra(EXTRA_CABLE))
                     // The daemon saw this phone kill IPick in the background.
@@ -269,7 +284,7 @@ class CallMonitorService : Service() {
                 val talk = intent.action == ACTION_TALK
                 val ends = callEnds
                 scope.launch {
-                    val ok = handOver(this@CallMonitorService, talk)
+                    val ok = handOver(this@CallMonitorService, talk, ticket)
                     Log.i(TAG, "monitor: ${if (talk) "talk to them" else "hang up"} -> $ok")
                     if (talk && ok && ifTheCallIsUp(ends, ::messageTaken)) startForegroundCompat()
                 }
@@ -398,6 +413,7 @@ class CallMonitorService : Service() {
 
     override fun onDestroy() {
         running = false
+        messageTicket = null
         scope.cancel()
         saves.clear()
         super.onDestroy()
@@ -430,12 +446,12 @@ class CallMonitorService : Service() {
     }
 
     /** The answering machine answered, and the greeting is playing. */
-    private fun onMessageStarted(test: Boolean) {
+    private fun onMessageStarted(test: Boolean, session: String?) {
         Log.i(TAG, "monitor: the answering machine is taking a message${if (test) " (test)" else ""}")
         callInProgress = true
         notRecording = false
         testing = test
-        messageTicket = java.util.UUID.randomUUID().toString()
+        messageTicket = session?.takeIf { it.matches(Regex("[0-9a-f-]{36}")) }
         startForegroundCompat()
     }
 
@@ -449,11 +465,6 @@ class CallMonitorService : Service() {
         Log.i(TAG, "monitor: a test call of the answering machine, ${seconds}s, noted")
     }
 
-    /** The user took the call over - unmuting on the call screen, Talk to
-     *  them, or answering a second call: a call like any other now. Never
-     *  late: the recorder sends no start once the call's end is on its way,
-     *  and its wakes arrive in order. So it may well be the first this
-     *  service hears of the call, if the message's own wake did not land. */
     private fun onMessageTaken() {
         Log.i(TAG, "monitor: the call was taken over")
         callInProgress = true
@@ -633,17 +644,18 @@ class CallMonitorService : Service() {
         }
     }
 
-    private fun messageAction(label: String, action: String, ticket: String): Notification.Action =
-        Notification.Action.Builder(
-            null as android.graphics.drawable.Icon?,
-            label,
+    private fun messageAction(label: String, action: String, ticket: String): Notification.Action {
+        val pending = messageActions.getOrPut("$ticket:$action") {
             PendingIntent.getService(
-                this,
-                action.hashCode(),
-                Intent(this, CallMonitorService::class.java).setAction(action).putExtra(EXTRA_TICKET, ticket),
-                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-            ),
-        ).build()
+                this, 0,
+                Intent(this, CallMonitorService::class.java).setAction(action)
+                    .setData(android.net.Uri.parse("ipick://message/$ticket/$action"))
+                    .putExtra(EXTRA_TICKET, ticket),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_ONE_SHOT,
+            )
+        }
+        return Notification.Action.Builder(null as android.graphics.drawable.Icon?, label, pending).build()
+    }
 
     /**
      * Tell the user a call went unrecorded, once, with the reason.
@@ -702,6 +714,12 @@ class CallMonitorService : Service() {
 
     companion object {
         private const val TAG = "IPick"
+        private val disconnectedMessages = MutableSharedFlow<String>(extraBufferCapacity = 1)
+
+        internal fun lastCallDisconnected() {
+            currentMessageSession?.let { disconnectedMessages.tryEmit(it) }
+        }
+
     /**
      * NOTE ON THE ".v2" IDS
      *
@@ -739,11 +757,12 @@ class CallMonitorService : Service() {
         /** Sent by the daemon when the answering machine has answered and its
          *  greeting is playing; [EXTRA_TEST] for a diagnostics test call. */
         const val ACTION_MESSAGE_STARTED = "app.ipick.voicemail.MESSAGE_STARTED"
-        /** Sent by the daemon when the user took over a message - unmuting on
-         *  the call screen, Talk to them, a second call answered - in Record
-         *  every call. */
         const val ACTION_MESSAGE_TAKEN = "app.ipick.voicemail.MESSAGE_TAKEN"
         const val EXTRA_TEST = "test"
+        const val EXTRA_MESSAGE_SESSION = "message_session"
+        @Volatile
+        var currentMessageSession: String? = null
+            private set
         /** With a test call's end: when its recording began, wall clock. */
         const val EXTRA_STARTED = "started"
         /** The "Taking a message" notification's buttons. */
@@ -773,7 +792,7 @@ class CallMonitorService : Service() {
 
         /** And to Talk to them (true) or Hang up. */
         @VisibleForTesting
-        internal var handOver: suspend (Context, Boolean) -> Boolean = CaptureDaemon::handOver
+        internal var handOver: suspend (Context, Boolean, String) -> Boolean = CaptureDaemon::handOver
 
         fun stop(context: Context) {
             runCatching {

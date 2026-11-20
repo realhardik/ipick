@@ -24,6 +24,8 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.ipick.voicemail.response.*
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import app.ipick.voicemail.R
 import app.ipick.voicemail.capture.Recording
 import java.time.Instant
 import java.time.LocalDate
@@ -56,9 +58,9 @@ internal fun VoicemailScreen(state: UiState, vm: MainViewModel) {
     val settings = state.screen == Screen.SETTINGS
     val snack = remember { SnackbarHostState() }
     LaunchedEffect(Unit) { vm.notices.collect { snack.showSnackbar(it) } }
-    LaunchedEffect(state.step) { if (!setup) vm.answer.opened() }
-    LaunchedEffect(state.screen) {
-        if (greeting) vm.answer.edit(status.status)
+    LaunchedEffect(state.step, autoText) { if (!setup && !autoText) vm.answer.opened() }
+    LaunchedEffect(state.screen, autoText) {
+        if (greeting && !autoText) vm.answer.edit(status.status)
         if (settings) vm.answer.reload()
     }
     BackHandler(enabled = greeting || settings || statusPage) { if (statusPage) vm.back() else vm.showScreen(Screen.HOME) }
@@ -81,37 +83,107 @@ internal fun VoicemailScreen(state: UiState, vm: MainViewModel) {
             }
             statusPage -> StatusPage(body, status, state.screen == Screen.CUSTOM_REPLY, vm)
             greeting -> if (autoText) TextReplyPage(body, status) else GreetingPage(body, answer, status, vm)
-            settings -> Column(body.verticalScroll(rememberScrollState()).padding(vertical = 16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                Title("Settings")
-                ProfileSettings()
-                Surface(shape = RoundedCornerShape(18.dp), color = MaterialTheme.colorScheme.surfaceContainerHighest) {
-                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        ResponseControls(status, answer, vm)
-                    }
-                }
-                HorizontalDivider()
-                ExceptionListSettings()
-                HorizontalDivider()
-                ShortcutSettings()
-                HorizontalDivider()
-                AudioSettings(answer, autoText, vm)
-                if (!state.daemonRunning && state.enabled) OutlinedButton(onClick = vm::startAgain) { Text("Retry connection") }
-                val labels = rememberPermissionRequest { vm.refresh() }
-                if (!state.canReadCallLog) TextButton(onClick = {
-                    labels.launch(arrayOf(android.Manifest.permission.READ_CALL_LOG, android.Manifest.permission.READ_CONTACTS))
-                }) { Text("Show caller names in the inbox") }
-            }
+            settings -> SettingsPages(body, state, answer, status, vm)
             else -> Inbox(body, state, answer, status, vm)
         }
     }
 }
 
+private enum class SettingsPage(val title: String) {
+    HOME("Settings"), GENERAL("General"), DND("Do Not Disturb"), PHONE("Phone & connection"),
+    AUDIO("Voicemail audio"), EXCEPTIONS("Call exceptions"), DND_EXCEPTIONS("DND exceptions")
+}
+
+@Composable
+private fun SettingsPages(modifier: Modifier, state: UiState, answer: AnswerUi, status: StatusState, vm: MainViewModel) {
+    val c = LocalContext.current
+    var page by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(SettingsPage.HOME) }
+    fun back() {
+        page = when (page) {
+            SettingsPage.EXCEPTIONS -> SettingsPage.GENERAL
+            SettingsPage.DND_EXCEPTIONS -> SettingsPage.DND
+            else -> SettingsPage.HOME
+        }
+    }
+    BackHandler(enabled = page != SettingsPage.HOME, onBack = ::back)
+    Column(modifier.padding(vertical = 12.dp)) {
+        if (page != SettingsPage.HOME) TextButton(onClick = ::back) { Text("‹  Back") }
+        Title(page.title)
+        Spacer(Modifier.height(12.dp))
+        if (page == SettingsPage.EXCEPTIONS || page == SettingsPage.DND_EXCEPTIONS) {
+            ExceptionListSettings(if (page == SettingsPage.EXCEPTIONS) CallExceptions.KEY else CallExceptions.DND_KEY)
+        } else key(page) {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                when (page) {
+                    SettingsPage.HOME -> listOf(SettingsPage.GENERAL, SettingsPage.DND, SettingsPage.PHONE,
+                        SettingsPage.AUDIO).forEach { group ->
+                        ListItem(headlineContent = { Text(group.title) }, trailingContent = { Text("›") },
+                            modifier = Modifier.clickable { page = group })
+                    }
+                    SettingsPage.GENERAL -> {
+                        ResponseControls(state.enabled, status, answer, vm)
+                        ProfileSettings()
+                        TextButton(onClick = { page = SettingsPage.EXCEPTIONS }) { Text("Call exceptions  ›") }
+                    }
+                    SettingsPage.DND -> {
+                        Text(if (status.status == Availability.DND) "Phone DND is on" else "Phone DND is off",
+                            style = MaterialTheme.typography.titleMedium)
+                        Text("When DND is on, IPick starts your selected response immediately.")
+                        var repeats by remember { mutableStateOf(DndCalls.repeatsEnabled(c)) }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("Let the third call through within 15 minutes", Modifier.weight(1f))
+                            Switch(repeats, { repeats = it; DndCalls.setRepeats(c, it) })
+                        }
+                        TextButton(onClick = { page = SettingsPage.DND_EXCEPTIONS }) { Text("DND exceptions  ›") }
+                        Text("Your phone’s DND rules control which calls sound.", style = MaterialTheme.typography.bodySmall)
+                        TextButton(onClick = {
+                            runCatching { c.startActivity(android.content.Intent("android.settings.ZEN_MODE_SETTINGS")) }
+                                .onFailure { c.startActivity(android.content.Intent(android.provider.Settings.ACTION_SOUND_SETTINGS)) }
+                        }) { Text("Open phone DND settings") }
+                    }
+                    SettingsPage.PHONE -> {
+                        OfflineStartupSetting(state, vm::setStartWithoutWifi)
+                        if (!state.daemonRunning && state.enabled) OutlinedButton(onClick = vm::openConnectionSetup) { Text("Open connection setup") }
+                        val labels = rememberPermissionRequest { vm.refresh() }
+                        if (!state.canReadCallLog || !app.ipick.voicemail.calls.CallLogLookup.photosGranted(c)) TextButton(onClick = {
+                            labels.launch(Setup.CALLER_PERMISSIONS)
+                        }) { Text("Allow caller identification") }
+                    }
+                    SettingsPage.AUDIO -> AudioSettings(answer, status.mode == ResponseMode.AUTO_TEXT, vm)
+                    else -> Unit
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun OfflineStartupSetting(state: UiState, onChange: (Boolean) -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text("Start without Wi-Fi", Modifier.weight(1f), fontWeight = FontWeight.SemiBold)
+        Switch(checked = state.startWithoutWifi, onCheckedChange = onChange)
+    }
+    Text("After each phone restart, connect to Wi-Fi once. Voicemail can then restart on its own while you’re away from Wi-Fi.",
+        style = MaterialTheme.typography.bodySmall)
+    Text("This opens debugging port 5555 on the networks you join while USB debugging is on. Other devices can request access. This connection is unencrypted.",
+        style = MaterialTheme.typography.bodySmall)
+    val detail = when {
+        state.portCloseFailed && state.portSet && !state.startWithoutWifi -> "Android kept the debugging port open. Restart your phone to close it."
+        !state.startWithoutWifi && state.portOurs && state.portSet -> "Waiting for Wireless debugging to close the port."
+        state.startWithoutWifi && state.portSet -> "Ready until your phone restarts."
+        state.startWithoutWifi && state.portFailed -> "Android could not prepare offline startup this time."
+        state.startWithoutWifi -> "Waiting for Wi-Fi and Wireless debugging to prepare offline startup."
+        else -> null
+    }
+    if (detail != null) Text(detail, style = MaterialTheme.typography.bodySmall)
+}
+
 private fun readiness(state: UiState, a: AnswerUi): String = when {
-    !state.enabled -> "Voicemail is off"
+    !state.enabled -> "IPick is off"
     !state.daemonRunning && !state.onWifi -> "Connect to Wi-Fi to restart voicemail"
     !state.daemonRunning -> "Voicemail helper is offline"
     a.paused != null -> "Paused for emergency callbacks"
-    !a.enabled -> "Voicemail is off"
+    a.blocked != null -> a.blocked.orEmpty()
     else -> "Ready to take messages"
 }
 
@@ -130,20 +202,23 @@ private fun Inbox(modifier: Modifier, state: UiState, a: AnswerUi, status: Statu
         verticalArrangement = Arrangement.spacedBy(10.dp)) {
         item {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(Modifier.weight(1f)) { Title("Voicemail") }
+                Box(Modifier.weight(1f)) { Title(stringResource(R.string.app_name)) }
                 IconButton(onClick = vm::showSettings) { Icon(Icons.Default.Settings, "Settings") }
             }
             Spacer(Modifier.height(10.dp))
-            Text(if (status.mode == ResponseMode.AUTO_TEXT) "Auto-text · ${status.status.title}" else readiness(state, a), color = cobalt, fontWeight = FontWeight.Medium)
+            Text(if (state.enabled && status.mode == ResponseMode.AUTO_TEXT) "SMS · ${status.status.title}" else readiness(state, a), color = cobalt, fontWeight = FontWeight.Medium)
+            if (!state.daemonRunning && state.enabled && status.mode == ResponseMode.VOICEMAIL) {
+                TextButton(onClick = vm::openConnectionSetup) { Text("Open connection setup") }
+            }
             Spacer(Modifier.height(12.dp))
         }
         if (groups.isEmpty()) item {
             Column(Modifier.fillMaxWidth().background(pale, RoundedCornerShape(18.dp)).padding(20.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text("No messages yet", fontSize = 21.sp, fontWeight = FontWeight.SemiBold)
-                Text(if (status.mode == ResponseMode.AUTO_TEXT) "Auto-text is selected. Saved voicemails stay in this inbox." else if (a.enabled) "Messages from unanswered calls will appear here."
-                    else "Choose a greeting and turn on voicemail to take your first message.")
-                if (!a.enabled && status.mode == ResponseMode.VOICEMAIL) Button(onClick = { vm.showScreen(Screen.ANSWERING_MACHINE) }) { Text("Set up greeting") }
+                Text(if (status.mode == ResponseMode.AUTO_TEXT) "SMS is selected. Saved voicemails stay in this inbox." else if (a.enabled) "Messages from unanswered calls will appear here."
+                    else "Turn on Enable IPick in Settings → General to take voicemail messages.")
+                if (!state.enabled) TextButton(onClick = vm::showSettings) { Text("Open settings") }
             }
         }
         groups.forEach { (day, messages) ->
@@ -166,7 +241,7 @@ private fun MessageRow(message: Recording, state: UiState, vm: MainViewModel) {
         .clickable(onClickLabel = if (playing) "Pause message" else "Play message") { vm.play(message) }.padding(12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
-                Text(message.caller ?: message.number ?: "Voicemail message", fontWeight = FontWeight.SemiBold, fontSize = 18.sp)
+                Text(message.caller ?: message.number ?: "Unknown caller", fontWeight = FontWeight.SemiBold, fontSize = 18.sp)
                 Text(message.whenLabel, style = MaterialTheme.typography.bodySmall)
             }
             Text(message.durationLabel)

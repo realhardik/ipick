@@ -150,7 +150,8 @@ class PairingService : Service() {
             Setup.markPaired(app)
 
             if (!waitAndConnect(app)) {
-                finishWith(TIMED_OUT, withReply = false)
+                val why = AdbTransport.lastWirelessError
+                finishWith(if (why == null) TIMED_OUT else "Paired. $why Open IPick to reconnect.", withReply = false)
                 return
             }
 

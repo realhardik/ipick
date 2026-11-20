@@ -6,9 +6,6 @@ import android.os.IInterface;
 
 import java.lang.reflect.Method;
 
-/**
- * TRIMMED FORK
- */
 @SuppressLint("PrivateApi,DiscouragedPrivateApi")
 public final class ServiceManager {
 

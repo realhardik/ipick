@@ -152,7 +152,7 @@ internal fun instruction(state: UiState): Instruction? = when (recorderStatus(st
 
 /** Off with all debugging, and nothing but Wi-Fi to come back on over: adbd
  *  is not on Start without Wi-Fi's port. */
-internal fun onNeedsWifi(state: UiState): Boolean = state.debuggingOff && !state.portSet
+internal fun onNeedsWifi(state: UiState): Boolean = state.debuggingOff && !(state.startWithoutWifi && state.portSet)
 
 /**
  * Whether home gives way to setup's pairing step (MainViewModel watches for

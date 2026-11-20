@@ -3,8 +3,8 @@ package app.ipick.voicemail.adb
 import android.content.Context
 import android.os.Build
 import android.util.Log
+import app.ipick.voicemail.capture.StartWithoutWifi
 import io.github.muntashirakon.adb.AbsAdbConnectionManager
-import io.github.muntashirakon.adb.AdbStream
 import io.github.muntashirakon.adb.android.AdbMdns
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
@@ -19,15 +19,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
-/**
- * Concrete [AbsAdbConnectionManager] bound to this app's persisted identity.
- *
- * The only interesting line is setApi(). It tells the library which wire
- * protocol the daemon on the other end speaks. We are always talking to the
- * adbd on the same phone the app is running on, so the running SDK_INT is by
- * definition correct - there is no remote device whose version could differ.
- */
-private class JemAdbConnectionManager(context: Context) : AbsAdbConnectionManager() {
+private class PairingManager(context: Context) : AbsAdbConnectionManager() {
 
     private val identity = AdbIdentity.getOrCreate(context)
 
@@ -55,12 +47,6 @@ object AdbTransport {
     /** adbd is on this phone. There is no other host this could ever be. */
     const val LOOPBACK = "127.0.0.1"
 
-    /**
-     * The legacy fixed ADB-over-TCP port. Only reachable if something has set
-     * `service.adb.tcp.port` - Start without Wi-Fi, or a computer's `adb
-     * tcpip`; tried as a last resort because when it IS set it is stable
-     * across Wi-Fi state, which no mDNS-discovered port is.
-     */
     const val LEGACY_TCP_PORT = 5555
 
     /** `exec:` rather than `shell:` so adbd allocates no PTY. See ShellSession. */
@@ -76,10 +62,13 @@ object AdbTransport {
     @Volatile
     private var shell: ShellSession? = null
     private val mutex = Mutex()
+    @Volatile private var connection: VerifiedAdbConnection? = null
+
+    private fun authenticated() = connection?.isConnected == true
 
     private fun manager(context: Context): AbsAdbConnectionManager =
         manager ?: synchronized(this) {
-            manager ?: JemAdbConnectionManager(context.applicationContext).also { manager = it }
+            manager ?: PairingManager(context.applicationContext).also { manager = it }
         }
 
     /**
@@ -91,19 +80,13 @@ object AdbTransport {
     var lastKnownConnected: Boolean = false
         private set
 
-    /**
-     * The port the live connection was made on, 0 for none. On 5555 it came
-     * over Start without Wi-Fi's port - autoConnect's last resort, where
-     * Wireless debugging cannot be had - and closing that port would take the
-     * only way back to the recorder with it (CaptureDaemon.portChangeOver).
-     */
     @Volatile
     var connectedPort: Int = 0
         private set
 
     val isConnected: Boolean
         get() = try {
-            (manager?.isConnected == true).also { lastKnownConnected = it }
+            authenticated().also { lastKnownConnected = it }
         } catch (t: Throwable) {
             lastKnownConnected = false
             false
@@ -120,6 +103,7 @@ object AdbTransport {
     suspend fun pair(context: Context, host: String, port: Int, code: String): Result<Unit> =
         withContext(Dispatchers.IO) {
             runCatching {
+                require(host == LOOPBACK && port in 1..65535) { "Only on-device ADB pairing is supported" }
                 Log.i(TAG, "pair: $host:$port")
                 val ok = manager(context).pair(host, port, code)
                 check(ok) { "adbd rejected the pairing code" }
@@ -131,69 +115,96 @@ object AdbTransport {
 
     suspend fun connect(context: Context, host: String, port: Int): Result<Unit> =
         withContext(Dispatchers.IO) {
-            runCatching {
-                val mgr = manager(context)
-                if (mgr.isConnected) {
-                    Log.i(TAG, "connect: already connected")
-                    return@runCatching
+            mutex.withLock {
+                runCatching {
+                    require(host == LOOPBACK && port in 1..65535) { "Only on-device ADB connections are supported" }
+                    if (!authenticated()) connectVerified(context, port,
+                        allowLegacy = port == LEGACY_TCP_PORT && StartWithoutWifi.enabled(context))
                 }
-                Log.i(TAG, "connect: $host:$port")
-                forgetShell()
-                val ok = mgr.connect(host, port)
-                check(ok || mgr.isConnected) { "connect refused by adbd at $host:$port" }
-                connectedPort = port
-                Log.i(TAG, "connect: established")
             }
         }
 
-    /**
-     * Find adbd without being told where it is, in the order that degrades
-     * best: mDNS first (correct whenever there is a network), then the fixed
-     * legacy port (correct whenever someone has pinned it, including with Wi-Fi
-     * off), and only then give up.
-     */
+    suspend fun connectWireless(context: Context, port: Int): Result<Unit> = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            runCatching {
+                require(port in 1..65535)
+                connectVerified(context, port)
+                lastConnect = ConnectOutcome.CONNECTED
+            }
+        }
+    }
+
     suspend fun autoConnect(context: Context, timeoutMs: Long = 5_000): Result<Unit> =
         withContext(Dispatchers.IO) {
-            lastConnect = ConnectOutcome.NONE
-            runCatching {
-                val mgr = manager(context)
-                if (mgr.isConnected) {
-                    Log.i(TAG, "autoConnect: already connected")
-                    lastConnect = ConnectOutcome.CONNECTED
-                    return@runCatching
-                }
-                forgetShell()
-
-                val discovered = discoverPort(context, AdbMdns.SERVICE_TYPE_TLS_CONNECT, timeoutMs)
-                if (discovered != null) {
-                    Log.i(TAG, "autoConnect: mDNS found connect port $discovered")
-                    // See connect() above: false is ambiguous, isConnected is
-                    // not. A throw here is adbd turning us away at the TLS
-                    // handshake - which is what a forgotten pairing looks like.
-                    val accepted = runCatching { mgr.connect(LOOPBACK, discovered) }
-                        .onFailure { Log.w(TAG, "autoConnect: port $discovered refused us - ${it.message}") }
-                        .getOrDefault(false) || mgr.isConnected
-                    if (accepted) {
+            mutex.withLock {
+                lastConnect = ConnectOutcome.NONE
+                runCatching {
+                    if (authenticated()) {
                         lastConnect = ConnectOutcome.CONNECTED
-                        connectedPort = discovered
                         return@runCatching
                     }
-                    Log.w(TAG, "autoConnect: mDNS port $discovered did not accept us")
-                    lastConnect = ConnectOutcome.REFUSED
-                } else {
-                    Log.i(TAG, "autoConnect: no mDNS advertisement (Wi-Fi off, Wireless debugging off, or not allowed on this Wi-Fi)")
-                    lastConnect = ConnectOutcome.NOT_FOUND
-                }
-
-                Log.i(TAG, "autoConnect: trying fixed port $LEGACY_TCP_PORT")
-                val ok = mgr.connect(LOOPBACK, LEGACY_TCP_PORT)
-                check(ok || mgr.isConnected) {
-                    "no adbd found by mDNS, and nothing listening on $LEGACY_TCP_PORT"
-                }
-                lastConnect = ConnectOutcome.CONNECTED
-                connectedPort = LEGACY_TCP_PORT
+                    val reported = app.ipick.voicemail.capture.SystemProperty.read("service.adb.tls.port")
+                        ?.toIntOrNull()?.takeIf { it in 1..65535 }
+                    var wirelessFailure: Throwable? = null
+                    suspend fun tryWireless(port: Int): Boolean {
+                        return runCatching { connectVerified(context, port) }.onFailure {
+                            wirelessFailure = it
+                            Log.w(TAG, "ADB endpoint verification failed", it)
+                        }.isSuccess
+                    }
+                    if (reported != null && tryWireless(reported)) {
+                        lastConnect = ConnectOutcome.CONNECTED
+                        return@runCatching
+                    }
+                    val discovered = discoverPort(context, AdbMdns.SERVICE_TYPE_TLS_CONNECT, timeoutMs)
+                    if (discovered != null && discovered != reported) {
+                        if (tryWireless(discovered)) {
+                            lastConnect = ConnectOutcome.CONNECTED
+                            return@runCatching
+                        }
+                    }
+                    lastConnect = if (wirelessFailure == null) ConnectOutcome.NOT_FOUND else ConnectOutcome.REFUSED
+                    if (!StartWithoutWifi.ready(context)) {
+                        throw wirelessFailure ?: java.io.IOException("IPick could not find the Wireless debugging port.")
+                    }
+                    connectVerified(context, LEGACY_TCP_PORT, allowLegacy = true)
+                    lastConnect = ConnectOutcome.CONNECTED
+                }.onSuccess { lastWirelessError = null }.onFailure { lastWirelessError = it.localizedMessage }
             }
         }
+
+    @Volatile
+    var lastWirelessError: String? = null
+        private set
+
+    private suspend fun connectVerified(context: Context, port: Int, allowLegacy: Boolean = false) = coroutineScope {
+        lastKnownConnected = false
+        connectedPort = 0
+        connection?.close()
+        connection = null
+        forgetShell()
+        val candidate = VerifiedAdbConnection()
+        val deadline = android.os.SystemClock.elapsedRealtime() + 20_000
+        val watchdog = launch(Dispatchers.IO) {
+            kotlinx.coroutines.delay(20_000)
+            candidate.close()
+        }
+        try {
+            candidate.connect(context, port, allowLegacy)
+            check(android.os.SystemClock.elapsedRealtime() < deadline && candidate.isConnected) {
+                "ADB connection ended during verification"
+            }
+            connection = candidate
+            connectedPort = port
+            lastKnownConnected = true
+            Log.i(TAG, "ADB endpoint verified")
+        } catch (t: Throwable) {
+            candidate.close()
+            throw t
+        } finally {
+            watchdog.cancel()
+        }
+    }
 
     /**
      * The shell kept from a connection before this one goes with it. A new
@@ -209,24 +220,17 @@ object AdbTransport {
         shell = null
     }
 
-    /**
-     * Have adbd restart itself listening on its classic port too
-     * (`tcpip:<port>`), or no longer (`usb:`) - what `adb tcpip` and `adb usb`
-     * send. adbd sets service.adb.tcp.port, answers one line and restarts, so
-     * this connection - and every process adbd started, the recorder too -
-     * goes with it; the caller closes this side and connects again. The line
-     * adbd answered, as "restarting in TCP mode port: 5555" - or a failure
-     * that means nothing about the restart: on the Honor, 2026-10-28, `usb:`
-     * restarted adbd before its line arrived ("Stream closed."), and the
-     * property was cleared all the same.
-     */
-    suspend fun restartAdbd(service: String, timeoutMs: Long = 5_000): Result<String> =
+    suspend fun restartAdbd(context: Context, service: String, timeoutMs: Long = 5_000): Result<String> =
         withContext(Dispatchers.IO) {
-            val mgr = manager
+            val mgr = connection
             if (mgr == null || !mgr.isConnected) {
                 return@withContext Result.failure(IllegalStateException("ADB is not connected"))
             }
             mutex.withLock {
+                if (service != "usb:" && !(service == "tcpip:$LEGACY_TCP_PORT" && StartWithoutWifi.enabled(context)))
+                    return@withLock Result.failure(SecurityException("Offline startup is disabled"))
+                if (connection !== mgr || !mgr.isConnected)
+                    return@withLock Result.failure(IllegalStateException("ADB connection is not verified"))
                 forgetShell()
                 // A stream that never answers is let go by closing the whole
                 // connection, as exec's watchdog does; it is about to die anyway.
@@ -290,44 +294,22 @@ object AdbTransport {
         port.get().takeIf { it > 0 }
     }
 
-    /**
-     * Run one command and return everything it wrote.
-     *
-     * Deliberately uses the one-shot `shell:<cmd>` form rather than opening an
-     * interactive `shell:` and writing to it. One-shot means adbd closes the
-     * stream when the command finishes, so end-of-output is EOF and not a
-     * guess. The interactive form never signals completion, which is fine for a
-     * terminal and useless for "run this and tell me what it said".
-     *
-     * The destination string is built directly instead of going through
-     * LocalServices.getDestination(SHELL, ...), which double-quotes any
-     * argument containing a space - turning `echo hi` into the single command
-     * `"echo hi"`.
-     *
-     * Note this is the LEGACY shell protocol: stdout and stderr are merged and
-     * there is no exit status. Adequate for identification and diagnostics.
-     */
     suspend fun exec(command: String, timeoutMs: Long = 15_000): Result<String> =
         withContext(Dispatchers.IO) {
-            // isConnected, not merely "a manager object exists". Opening a
-            // stream on a manager whose connection has died does not throw - it
-            // hands back a stream that yields nothing, so every command
-            // silently "succeeds" with no output.
-            val mgr = manager
+            val mgr = connection
             if (mgr == null || !mgr.isConnected) {
                 return@withContext Result.failure(IllegalStateException("ADB is not connected"))
             }
 
             mutex.withLock {
                 runCatching {
+                    check(connection === mgr && mgr.isConnected) { "ADB connection is not verified" }
                     // Watching from before the stream is opened: opening one
                     // can hang too, and then only closing the whole
                     // connection lets it go.
                     var session: ShellSession? = shell
                     val watchdog = launch {
                         kotlinx.coroutines.delay(timeoutMs)
-                        // The command's first word only: the daemon's launch
-                        // line carries its token.
                         Log.w(TAG, "exec: '${command.substringBefore(' ')} ...' timed out after ${timeoutMs}ms")
                         session?.let { runCatching { it.close() } } ?: runCatching { mgr.close() }
                         shell = null
@@ -350,7 +332,7 @@ object AdbTransport {
         }
 
 
-    private class ShellSession(private val stream: AdbStream) {
+    private class ShellSession(private val stream: VerifiedAdbConnection.Stream) {
         private val marker = "__ipick_" + java.util.UUID.randomUUID().toString().take(12) + "__"
         private val out = stream.openOutputStream()
         private val reader = stream.openInputStream().bufferedReader()
@@ -447,22 +429,26 @@ object AdbTransport {
     }
 
     suspend fun disconnect() = withContext(Dispatchers.IO) {
-        runCatching { shell?.close() }
-        shell = null
-        runCatching { manager?.disconnect() }
-        connectedPort = 0
-        Unit
+        mutex.withLock {
+            lastKnownConnected = false
+            connectedPort = 0
+            connection?.close()
+            connection = null
+            forgetShell()
+            Unit
+        }
     }
 
-    /** Drops the connection AND the in-memory manager, but never the identity
-     *  files - those are the pairing and must outlive any session. */
     suspend fun close() = withContext(Dispatchers.IO) {
-        runCatching { shell?.close() }
-        shell = null
-        runCatching { manager?.close() }
-        manager = null
-        lastKnownConnected = false
-        connectedPort = 0
-        Unit
+        mutex.withLock {
+            lastKnownConnected = false
+            connectedPort = 0
+            connection?.close()
+            connection = null
+            forgetShell()
+            runCatching { manager?.disconnect() }
+            manager = null
+            Unit
+        }
     }
 }

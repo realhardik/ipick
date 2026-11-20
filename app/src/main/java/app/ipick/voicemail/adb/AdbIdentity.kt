@@ -2,6 +2,7 @@ package app.ipick.voicemail.adb
 
 import android.content.Context
 import android.util.Log
+import app.ipick.voicemail.security.SecretStorage
 import org.bouncycastle.asn1.x500.X500Name
 import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
@@ -27,12 +28,11 @@ internal class AdbIdentity private constructor(
         private const val TAG = "IPick"
         private const val KEY_FILE = "adb_private_key.der"
         private const val CERT_FILE = "adb_certificate.der"
+        private const val SEALED_KEY = "adb_identity"
 
         private const val KEY_SIZE = 2048
         private const val SUBJECT = "CN=IPick, O=IPick, C=US"
 
-        /** SHA-256 rather than the sample's SHA-512: universally supported by
-         *  adbd's TLS stack and by Android's own JCA providers. */
         private const val SIGNATURE_ALGORITHM = "SHA256withRSA"
 
         private const val THIRTY_YEARS_MS = 30L * 365 * 24 * 60 * 60 * 1000
@@ -52,7 +52,7 @@ internal class AdbIdentity private constructor(
             val keyFile = File(context.filesDir, KEY_FILE)
             val certFile = File(context.filesDir, CERT_FILE)
 
-            val loaded = tryLoad(keyFile, certFile)
+            val loaded = tryLoad(context, keyFile, certFile)
             if (loaded != null) {
                 Log.i(TAG, "ADB identity: loaded existing keypair")
                 cached = loaded
@@ -61,11 +61,8 @@ internal class AdbIdentity private constructor(
 
             Log.i(TAG, "ADB identity: no stored keypair, generating a new one")
             val created = generate()
-            // Write the key first. If we crash between the two writes, the next
-            // tryLoad sees a key with no certificate, fails its pair check, and
-            // regenerates both - rather than loading a mismatched pair.
-            keyFile.writeBytes(created.privateKey.encoded)
             certFile.writeBytes(created.certificate.encoded)
+            SecretStorage.write(context, SEALED_KEY, created.privateKey.encoded)
             cached = created
             return created
         }
@@ -84,12 +81,13 @@ internal class AdbIdentity private constructor(
          */
         /** Whether this app has ever paired. False after a reset. */
         fun exists(context: Context): Boolean =
-            File(context.filesDir, KEY_FILE).exists() &&
+            (SecretStorage.exists(context, SEALED_KEY) || File(context.filesDir, KEY_FILE).exists()) &&
                 File(context.filesDir, CERT_FILE).exists()
 
         @Synchronized
         fun forget(context: Context) {
             cached = null
+            SecretStorage.delete(context, SEALED_KEY)
             listOf(KEY_FILE, CERT_FILE).forEach { name ->
                 val file = File(context.filesDir, name)
                 if (file.exists() && !file.delete()) {
@@ -99,20 +97,23 @@ internal class AdbIdentity private constructor(
             Log.i(TAG, "ADB identity: forgotten, pairing will be needed again")
         }
 
-        private fun tryLoad(keyFile: File, certFile: File): AdbIdentity? {
-            if (!keyFile.exists() || !certFile.exists()) return null
-            return try {
+        private fun tryLoad(context: Context, keyFile: File, certFile: File): AdbIdentity? {
+            val sealed = SecretStorage.exists(context, SEALED_KEY)
+            if (!sealed && !keyFile.exists()) return null
+            check(certFile.exists()) { "ADB certificate is missing; reset pairing in Settings" }
+            val encoded = if (sealed) SecretStorage.read(context, SEALED_KEY) else keyFile.readBytes()
+            try {
                 val privateKey = KeyFactory.getInstance("RSA")
-                    .generatePrivate(PKCS8EncodedKeySpec(keyFile.readBytes()))
+                    .generatePrivate(PKCS8EncodedKeySpec(encoded))
                 val certificate = CertificateFactory.getInstance("X.509")
                     .generateCertificate(ByteArrayInputStream(certFile.readBytes()))
-                AdbIdentity(privateKey, certificate)
-            } catch (t: Throwable) {
-                // A corrupt or half-written pair is not worth recovering: the
-                // cost of regenerating is one re-pairing, the cost of loading a
-                // broken identity is a handshake failure with no clear message.
-                Log.w(TAG, "ADB identity: stored keypair unreadable, regenerating", t)
-                null
+                check((privateKey as java.security.interfaces.RSAPrivateKey).modulus ==
+                    (certificate.publicKey as java.security.interfaces.RSAPublicKey).modulus) { "ADB identity does not match its certificate" }
+                if (!sealed) SecretStorage.write(context, SEALED_KEY, encoded)
+                check(!keyFile.exists() || keyFile.delete()) { "Could not remove the old plaintext ADB key" }
+                return AdbIdentity(privateKey, certificate)
+            } finally {
+                encoded.fill(0)
             }
         }
 

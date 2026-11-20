@@ -14,9 +14,8 @@ plugins {
 sourceSets {
     main {
         java {
-            setSrcDirs(listOf("../src", "../../app/src/main/java"))
+            setSrcDirs(listOf("../src"))
             include("app/ipick/voicemail/shell/AnswerMachine.java")
-            include("app/ipick/voicemail/shortcuts/VolumeHold.java")
             include("app/ipick/voicemail/shell/AnswerSettings.java")
             include("app/ipick/voicemail/shell/CallReport.java")
             include("app/ipick/voicemail/shell/CallStates.java")
@@ -72,6 +71,7 @@ tasks.register<JavaCompile>("errorProne") {
     group = "verification"
     dependsOn(errorProneBuildConfig)
     source = fileTree("../src") { include("**/*.java") } +
+        fileTree("../../app/src/main/java") { include("app/ipick/voicemail/answering/GreetingCue.java") } +
         fileTree(layout.buildDirectory.dir("errorprone/gen")) { include("**/*.java") }
     val platform = System.getenv("ANDROID_PLATFORM") ?: "36"
     classpath = files("$androidSdk/platforms/android-$platform/android.jar")
@@ -116,16 +116,7 @@ tasks.register<JavaCompile>("errorProne") {
     ))
 }
 
-// COVERAGE AND MUTATION TESTING OF THE DAEMON'S DECISIONS - reports, not gates.
-//
-// Coverage says which lines the tests above run; mutation testing (PIT) says
-// whether they would notice those lines being wrong: it changes the compiled
-// code one small way at a time - a < made <=, a return true made false - and
-// runs the tests against each change. A change no test fails on is a decision
-// the tests do not pin. These classes are the daemon's decisions in plain Java
-// (CLAUDE.md), which is what PIT reads best.
-//
-// Neither runs unless asked, so a plain build or test run resolves nothing new:
+// Optional coverage and mutation reports:
 //   ./gradlew :daemon-tests:test -Pcoverage  -> build/reports/jacoco/test/html
 //   ./gradlew :daemon-tests:pitest           -> build/reports/pitest
 if (providers.gradleProperty("coverage").isPresent) {

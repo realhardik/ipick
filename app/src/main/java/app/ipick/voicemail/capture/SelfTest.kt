@@ -328,12 +328,6 @@ object SelfTest {
         return null
     }
 
-    /**
-     * What to do about tracking the recorder could not allow. On an OPPO,
-     * OnePlus or realme phone with its switch off the shell may not change an
-     * app-op (ShellGrant; CallVault measured `appops set` refused there), so a
-     * restart alone would only be refused again.
-     */
     private fun trackingFix(): String =
         if (ShellGrant.switchMayBeOff()) "In Developer options, turn on ${ShellGrant.SWITCH}. $RESTART" else RESTART
 

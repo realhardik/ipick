@@ -18,27 +18,7 @@ import java.util.concurrent.TimeUnit
 /**
  * Keeps the shell-side recorder alive, without the app staying alive to do it.
  *
- * WHAT THIS REPLACED
- *
- * The daemon used to be watched by a poll loop inside a PERMANENT foreground
- * service - which is the whole reason that service, and its permanent
- * notification, existed. Now the daemon watches call state itself and wakes the
- * app only for a call, so the app is dormant between calls and there is no
- * service running a loop.
- *
- * But the daemon can still die - a reboot kills it, and the system reclaims it
- * eventually (measured once at ~13 hours) - and a dead daemon records nothing
- * while nothing notices. So the one thing the watchdog genuinely had to do,
- * revive a dead daemon, becomes a scheduled job instead of a running loop.
- *
- * WHY WORKMANAGER AND NOT AN ALARM
- *
- * It survives reboot, it batches with the system's other maintenance work
- * rather than waking the phone alone, and it retries with backoff on its own.
- * The 15-minute floor on its period is fine: the daemon dying is rare, and a
- * call in the gap is the cost of not holding a permanent service - which is the
- * trade the user chose. Boot and app-open both kick an immediate one-off so the
- * common cases do not wait for the period.
+ * WorkManager batches recovery with system maintenance. Boot and app-open also request a check.
  */
 class RecorderKeepAlive(
     context: Context,

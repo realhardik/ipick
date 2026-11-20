@@ -22,8 +22,11 @@ import app.ipick.voicemail.recordings.RecordingSaver
 import app.ipick.voicemail.rethrowingCancellation
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.cancel
@@ -50,6 +53,9 @@ import android.widget.Toast
 class CallTracker : InCallService() {
 
     private val handler = Handler(Looper.getMainLooper())
+    private val callGenerations = mutableMapOf<Call, Long>()
+    private val ringTokens = mutableMapOf<Call, Long?>()
+    private var mayHaveVoicemail = false
     private val pendingTexts = mutableMapOf<Call, Runnable>()
 
     private val manualScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -59,15 +65,62 @@ class CallTracker : InCallService() {
     private var destroyed = false
     private val manualHandled = mutableSetOf<Call>()
 
+    private var dndWatch: Job? = null
+    private val answerVersions = mutableMapOf<Call, Int>()
     private val exceptedCalls = mutableSetOf<Call>()
-    private var stopExceptionWatch: (() -> Unit)? = null
+    private val exceptionWatches = mutableListOf<() -> Unit>()
 
     override fun onCreate() {
         super.onCreate()
-        stopExceptionWatch = Prefs.watch(this, CallExceptions.KEY) {
+        exceptionWatches += Prefs.watch(this, StatusRepository.EPOCH) {
+            handler.post {
+                if (!destroyed) {
+                    pendingTexts.keys.filterNot(::enabledFor).forEach { call ->
+                        pendingTexts.remove(call)?.let(handler::removeCallbacks)
+                    }
+                    for ((call, ring) in ringTokens) {
+                        if (ring != null && !enabledFor(call) && call.state == Call.STATE_RINGING) {
+                            manualScope.launch { CaptureDaemon.goAhead(this@CallTracker, -1, 0L, ring) }
+                        }
+                    }
+                    refreshDndWatch()
+                    refreshManual()
+                }
+            }
+        }
+        exceptionWatches += listOf(CallExceptions.KEY, CallExceptions.DND_KEY, DndCalls.REPEATS).map { key -> Prefs.watch(this, key) {
             handler.post {
                 if (!destroyed) {
                     calls.forEach(::applyException)
+                    refreshManual()
+                }
+            }
+        } }
+    }
+
+    private fun enabledFor(call: Call) = RecorderSwitch.isOn(this) &&
+        callGenerations[call] == StatusRepository.generation(this)
+
+    private fun refreshDndWatch() {
+        if (calls.none { it.state == Call.STATE_RINGING && enabledFor(it) }) {
+            dndWatch?.cancel()
+            dndWatch = null
+            return
+        }
+        if (dndWatch?.isActive == true) return
+        dndWatch = manualScope.launch {
+            var previous = StatusRepository.phoneDnd(this@CallTracker)
+            StatusRepository.watch(this@CallTracker, ringing = true).map { it.status == Availability.DND }.distinctUntilChanged().collect { active ->
+                if (previous != active) {
+                    previous = active
+                    calls.filter { it.state == Call.STATE_RINGING }.forEach { call ->
+                        applyException(call)
+                        pendingTexts.remove(call)?.let(handler::removeCallbacks)
+                        if (!isExcepted(call) && CallTracking.enabled(this@CallTracker) && manualInFlight !== call && call !in manualHandled) {
+                            if (StatusRepository.autoText(this@CallTracker)) scheduleText(call)
+                            else decideAnswer(call, lazy { CallRules.verdict(this@CallTracker, PhoneNumbers.of(call.details.handle)) })
+                        }
+                    }
                     refreshManual()
                 }
             }
@@ -75,7 +128,8 @@ class CallTracker : InCallService() {
     }
 
     private fun isExcepted(call: Call): Boolean =
-        call in exceptedCalls || CallExceptions.matches(this, call.details.handle)
+        call in exceptedCalls || CallExceptions.matches(this, call.details.handle) ||
+            (RecorderSwitch.isOn(this) && CallTracking.enabled(this) && DndCalls.allows(this, call.details))
 
     private fun applyException(call: Call) {
         if (call.state != Call.STATE_RINGING || call.details.callDirection != Call.Details.DIRECTION_INCOMING ||
@@ -83,24 +137,39 @@ class CallTracker : InCallService() {
         pendingTexts.remove(call)?.let(handler::removeCallbacks)
         AutoText.forget(call)
         if (!exceptedCalls.add(call)) return
-        // Also disarm an already queued answer or incoming-call diagnostic.
-        // Identify the helper's exact ring so a late cancellation cannot affect a new caller.
+        val ring = ringTokens[call] ?: return
+        manualScope.launch { CaptureDaemon.excludeRingingCall(this@CallTracker, ring) }
+    }
+
+    private fun checkRingingCall(call: Call) {
+        if (calls.singleOrNull() !== call || ringTokens.containsKey(call) || call.details.callDirection != Call.Details.DIRECTION_INCOMING) return
+        ringTokens[call] = null
         manualScope.launch {
-            repeat(4) {
-                if (destroyed || call !in calls || call.state != Call.STATE_RINGING) return@launch
-                val ring = CaptureDaemon.manualRingToken(this@CallTracker)
-                if (destroyed || call !in calls || call.state != Call.STATE_RINGING) return@launch
-                if (ring != null && CaptureDaemon.excludeRingingCall(this@CallTracker, ring)) return@launch
-                delay(250)
+            for (wait in longArrayOf(0, 100, 200, 400, 800, 1_500)) {
+                if (wait > 0) delay(wait)
+                if (destroyed || calls.singleOrNull() !== call || call.state != Call.STATE_RINGING) return@launch
+                val token = CaptureDaemon.ringingToken(this@CallTracker, call.details.creationTimeMillis) ?: return@launch
+                if (destroyed || calls.singleOrNull() !== call || call.state != Call.STATE_RINGING || !CallTracking.enabled(this@CallTracker)) return@launch
+                if (token > 0) {
+                    ringTokens[call] = token
+                    if (!enabledFor(call)) return@launch
+                    if (isExcepted(call)) {
+                        exceptedCalls.add(call)
+                        CaptureDaemon.excludeRingingCall(this@CallTracker, token)
+                    } else {
+                        refreshManual()
+                        decideAnswer(call, lazy { CallRules.verdict(this@CallTracker, PhoneNumbers.of(call.details.handle)) })
+                    }
+                    return@launch
+                }
             }
-            Log.w(TAG, "calltrack: could not confirm exception cancellation with the helper")
         }
     }
 
     private fun eligibleManual(call: Call): Boolean =
-        !destroyed && !isExcepted(call) && calls.size == 1 && call in calls && call.state == Call.STATE_RINGING &&
+        !destroyed && enabledFor(call) && (ringTokens[call] != null || StatusRepository.autoText(this)) && !isExcepted(call) && calls.size == 1 && call in calls && call.state == Call.STATE_RINGING &&
             call.details.callDirection == Call.Details.DIRECTION_INCOMING &&
-            RecorderSwitch.isOn(this) && CallTracking.enabled(this) &&
+            CallTracking.enabled(this) &&
             !EmergencyPause.isEmergency(this, call) && !EmergencyPause.isCallback(call.details) &&
             EmergencyPause.pausedUntil(this, EmergencyPause.telecomLast(call.details)) == null &&
             call !in manualHandled && !AutoText.wasSubmitted(call)
@@ -135,12 +204,16 @@ class CallTracker : InCallService() {
         manualScope.launch {
             var commandSent = false
             try {
-                val ring = CaptureDaemon.manualRingToken(this@CallTracker)
-                    ?: error("Reconnect the updated voicemail helper and try again.")
+                val ring = CaptureDaemon.ringingToken(this@CallTracker, call.details.creationTimeMillis)
+                if (ring == null || ring <= 0 || (!StatusRepository.autoText(this@CallTracker) && ringTokens[call] != ring)) {
+                    error("Voicemail is unavailable for this call.")
+                }
                 if (!eligibleManual(call)) return@launch
                 check(CaptureDaemon.syncGreeting(this@CallTracker)) { "Couldn’t load your greeting. Try again." }
                 if (!eligibleManual(call)) return@launch
+                rememberMessageCaller(call)
                 commandSent = true
+                mayHaveVoicemail = true
                 val accepted = CaptureDaemon.sendToVoicemail(this@CallTracker, ring)
                 if (!accepted) error("Couldn’t confirm voicemail started. The call may have ended or been answered.")
             } catch (e: kotlinx.coroutines.CancellationException) {
@@ -160,18 +233,19 @@ class CallTracker : InCallService() {
 
     private fun scheduleText(call: Call) {
         val details = call.details
-        if (isExcepted(call) || !StatusRepository.autoText(this) || manualInFlight === call || call in manualHandled) return
-        if (calls.size != 1 || details.state != Call.STATE_RINGING ||
-            details.callDirection != Call.Details.DIRECTION_INCOMING || call in pendingTexts) return
-        val configured = AnsweringMachine.responseDelay(this)
-        val seconds = AnsweringMachine.effectiveDelay(configured, AnsweringMachine.dndShort(this),
-            AnswerConditions.dndSilences(this, details.handle))
+        val generation = callGenerations[call] ?: return
+        if (!enabledFor(call) || !StatusRepository.autoText(this) || isExcepted(call) || AutoText.wasSubmitted(call)) return
+        if (calls.singleOrNull() !== call || details.state != Call.STATE_RINGING ||
+            details.callDirection != Call.Details.DIRECTION_INCOMING || call in pendingTexts ||
+            manualInFlight === call || call in manualHandled) return
+        val seconds = AnsweringMachine.responseDelay(this)
         val elapsed = (System.currentTimeMillis() - details.creationTimeMillis).coerceAtLeast(0)
         val remaining = seconds * 1000L - elapsed
-        val generation = StatusRepository.generation(this)
         val task = Runnable {
             pendingTexts.remove(call)
-            if (calls.size == 1 && call in calls && manualInFlight !== call && call !in manualHandled) AutoText.send(this, call, generation)
+            if (calls.singleOrNull() === call && !isExcepted(call) && manualInFlight !== call && call !in manualHandled) {
+                AutoText.send(this, call, generation)
+            }
             refreshManual()
         }
         pendingTexts[call] = task
@@ -180,9 +254,12 @@ class CallTracker : InCallService() {
 
     override fun onDestroy() {
         destroyed = true
-        stopExceptionWatch?.invoke()
-        stopExceptionWatch = null
+        exceptionWatches.forEach { it() }
+        exceptionWatches.clear()
         exceptedCalls.clear()
+        answerVersions.clear()
+        callGenerations.clear()
+        ringTokens.clear()
         clearManual()
         manualScope.cancel()
         calls.forEach(AutoText::forget)
@@ -215,12 +292,9 @@ class CallTracker : InCallService() {
         if (!CallTracking.enabled(this)) return
         changed(call)
         if (isExcepted(call)) return
-        // Whose calls to keep, asked once for both: the contacts lookup is
-        // the costly part of each, and the two must judge the caller alike.
         val number = PhoneNumbers.of(call.details.handle)
         val keeps = lazy { CallRules.verdict(applicationContext, number) }
         decideEarly(call, keeps)
-        if (StatusRepository.autoText(this)) scheduleText(call) else decideAnswer(call, keeps)
     }
 
     /**
@@ -231,13 +305,17 @@ class CallTracker : InCallService() {
      * read the contacts.
      */
     private fun decideAnswer(call: Call, keeps: Lazy<Boolean?>) {
+        val ring = ringTokens[call] ?: return
         val context = applicationContext
-        if (isExcepted(call) || !AnsweringMachine.enabled(context)) return
+        if (!enabledFor(call) || isExcepted(call) || !AnsweringMachine.enabled(context) ||
+            AnswerDiagnostics.stageOne(context)?.possible != true) return
         if (call.details.callDirection != Call.Details.DIRECTION_INCOMING || call.state != Call.STATE_RINGING) return
         // Sent with the go-ahead, so one that comes too late for its own
         // ring is never taken for the next caller's. The recorder's clock:
         // since boot, the same in both processes, and a wall-clock step
         // before the go-ahead lands does not move it.
+        val version = (answerVersions[call] ?: 0) + 1
+        answerVersions[call] = version
         val rangAt = android.os.SystemClock.elapsedRealtime()
         val others = calls.size - 1
         val handle = call.details.handle
@@ -262,8 +340,16 @@ class CallTracker : InCallService() {
             when (decision) {
                 is AnsweringMachine.Decision.Answer -> {
                     Log.i(TAG, "calltrack: answering machine - answer after ${decision.delaySeconds} s")
-                    goAheads.trySend(GoAhead(context, decision.delaySeconds * 1000, rangAt) {
-                        !destroyed && call in calls && call.state == Call.STATE_RINGING && !isExcepted(call)
+                    withContext(Dispatchers.Main.immediate) {
+                        if (!destroyed && ringTokens[call] == ring && call.state == Call.STATE_RINGING) {
+                            mayHaveVoicemail = true
+                            rememberMessageCaller(call)
+                        }
+                    }
+                    goAheads.trySend(GoAhead(context, decision.delaySeconds * 1000, rangAt, ring) {
+                        !destroyed && ringTokens[call] == ring && calls.singleOrNull() === call &&
+                            call.state == Call.STATE_RINGING && !isExcepted(call) && enabledFor(call) && CallTracking.enabled(context) &&
+                            answerVersions[call] == version && manualInFlight !== call && call !in manualHandled
                     })
                 }
                 is AnsweringMachine.Decision.No -> Log.i(TAG, "calltrack: answering machine - not answering: ${decision.why}")
@@ -291,9 +377,7 @@ class CallTracker : InCallService() {
                 context.getSystemService(android.telephony.TelephonyManager::class.java).isNetworkRoaming
             }.getOrDefault(true),
             rulesKeep = keeps.value,
-            dndSilences = AnswerConditions.dndSilences(context, handle),
             delay = AnsweringMachine.responseDelay(context),
-            dndShort = AnsweringMachine.dndShort(context),
             simAllowed = AnswerConditions.simAllowed(context, account),
             // Messenger calls are invisible to this service (Telecom shows it
             // only calls it manages); the audio mode is theirs while they run.
@@ -305,7 +389,12 @@ class CallTracker : InCallService() {
     }
 
     override fun onCallRemoved(call: Call) {
+        if (calls.isEmpty() && call.state == Call.STATE_DISCONNECTED) CallMonitorService.lastCallDisconnected()
         exceptedCalls.remove(call)
+        answerVersions.remove(call)
+        callGenerations.remove(call)
+        ringTokens.remove(call)
+        refreshDndWatch()
         if (manualCall === call) clearManual()
         manualHandled.remove(call)
         AutoText.forget(call)
@@ -317,13 +406,6 @@ class CallTracker : InCallService() {
         if (emergencyCalls.remove(id) || EmergencyPause.isEmergency(this, call)) EmergencyPause.noteCall(this)
         wasActive -= id
         val wasLeftOut = leftOut.remove(id)
-        if (wasLeftOut) {
-            // A left-out call that rang and was never answered never went
-            // off-hook, so the daemon's skip is still waiting for it - and
-            // would take the next call, one the rules keep, instead. Taken
-            // back whether or not tracking is still on.
-            skips.trySend(applicationContext to false)
-        }
         if (!CallTracking.enabled(this)) {
             // Switched off mid-call: nothing more is kept - but a call left
             // out on purpose is still noted as such, or the missed-call check
@@ -338,14 +420,29 @@ class CallTracker : InCallService() {
             val tracked = CallTracking.calls(this).firstOrNull { it.id == id }
             CallLedger.noteSkipped(this, id, tracked?.incoming ?: true, tracked?.seconds ?: 0)
         }
-        if (calls.isEmpty()) collectSoon()
+        if (calls.isEmpty() && mayHaveVoicemail) {
+            mayHaveVoicemail = false
+            collectSoon()
+        }
     }
 
     /** A state change: note an answer or a hang-up. */
     private fun changed(call: Call) {
+        if (call.details.state == Call.STATE_RINGING && CallTracking.enabled(this)) {
+            callGenerations.getOrPut(call) { StatusRepository.generation(this) }
+            if (enabledFor(call)) {
+                refreshDndWatch()
+                if (StatusRepository.autoText(this)) scheduleText(call)
+                else {
+                    rememberMessageCaller(call)
+                    checkRingingCall(call)
+                }
+            }
+        }
         applyException(call)
         refreshManual()
         if (call.details.state != Call.STATE_RINGING) {
+            refreshDndWatch()
             pendingTexts.remove(call)?.let(handler::removeCallbacks)
             AutoText.forget(call)
         }
@@ -378,13 +475,22 @@ class CallTracker : InCallService() {
         // ignores it.
         if (becameActive && calls.size > 1) {
             val context = applicationContext
-            scope.launch { CaptureDaemon.handOver(context, talk = true) }
+            val session = CallMonitorService.currentMessageSession
+            if (session != null) scope.launch { CaptureDaemon.handOver(context, talk = true, session = session) }
         }
     }
 
     /** Whether each call was active at its last change, so a repeat of
      *  ACTIVE is not counted as a second answer. */
     private val wasActive = mutableMapOf<Long, Boolean>()
+
+    private fun rememberMessageCaller(call: Call) {
+        val details = call.details
+        if (call !in calls || details.handlePresentation != android.telecom.TelecomManager.PRESENTATION_ALLOWED ||
+            details.handle?.scheme != "tel") return
+        val number = PhoneNumbers.digits(PhoneNumbers.of(details.handle))?.takeIf { it.length <= 32 } ?: return
+        CallTracking.update(this, details.creationTimeMillis) { (it ?: track(call)).copy(messageNumber = number) }
+    }
 
     private fun track(call: Call): CallTracking.Tracked = CallTracking.Tracked(
         id = call.details.creationTimeMillis,
@@ -404,15 +510,6 @@ class CallTracker : InCallService() {
         clockOffset = System.currentTimeMillis() - System.nanoTime() / 1_000_000,
     )
 
-    /**
-     * Whose calls to keep, before recording: a call the rules leave out is
-     * known while it still rings (or as it is dialled), so the daemon is told
-     * not to record it at all. Only for a call on its own - with another one
-     * already up, the recording is shared and the saver splits it instead -
-     * and only in automatic mode, where the rules apply. And only with the
-     * call log and the contacts, as everywhere else that decides who a call
-     * was with: without them a call is kept (TelecomAccount.skipEarly).
-     */
     private fun decideEarly(call: Call, keeps: Lazy<Boolean?>) {
         val context = applicationContext
         val id = call.details.creationTimeMillis
@@ -426,8 +523,6 @@ class CallTracker : InCallService() {
         )
         if (!skip) return
         leftOut += id
-        Log.i(TAG, "calltrack: the rules leave this call out; telling the recorder")
-        skips.trySend(context to true)
     }
 
     /**
@@ -461,33 +556,16 @@ class CallTracker : InCallService() {
 
         /** A go-ahead for the answering machine: the delay, and when the
          *  ring it is for was seen. */
-        class GoAhead(val context: Context, val delayMs: Int, val rangAt: Long, val stillAllowed: () -> Boolean)
+        class GoAhead(val context: Context, val delayMs: Int, val rangAt: Long, val ring: Long, val stillAllowed: () -> Boolean)
 
-        /** Go-aheads, in order - like the skips, and on the same scope. */
         val goAheads = Channel<GoAhead>(Channel.UNLIMITED).also { channel ->
             scope.launch {
                 for (go in channel) {
                     if (!AnsweringMachine.enabled(go.context) || !withContext(Dispatchers.Main.immediate) { go.stillAllowed() }) continue
                     if (!CaptureDaemon.syncGreeting(go.context) || !AnsweringMachine.enabled(go.context) ||
                         !withContext(Dispatchers.Main.immediate) { go.stillAllowed() }) continue
-                    val state = CaptureDaemon.goAhead(go.context, go.delayMs, go.rangAt)
+                    val state = CaptureDaemon.goAhead(go.context, go.delayMs, go.rangAt, go.ring)
                     Log.i(TAG, "calltrack: answering machine go-ahead -> ${state ?: "the recorder did not take it"}")
-                }
-            }
-        }
-
-        /**
-         * Skips (true) and their take-backs (false), to the daemon one at a
-         * time and in the order they were decided. Launched separately, the
-         * take-back of a call hung up at once could land first - and leave the
-         * skip armed for the next call, one the rules keep.
-         */
-        val skips = Channel<Pair<Context, Boolean>>(Channel.UNLIMITED).also { channel ->
-            scope.launch {
-                for ((context, skip) in channel) {
-                    if (!CaptureDaemon.skipCall(context, skip) && skip) {
-                        Log.w(TAG, "calltrack: the recorder did not take the skip; the saver will delete it instead")
-                    }
                 }
             }
         }

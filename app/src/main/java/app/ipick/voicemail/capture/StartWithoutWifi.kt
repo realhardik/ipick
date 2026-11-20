@@ -101,7 +101,7 @@ object StartWithoutWifi {
      * can be read; where it cannot, whether IPick opened the port this boot.
      * The screens and the question before turning off say [readyForUser].
      */
-    fun ready(context: Context): Boolean = portSet() ?: openedThisBoot(context)
+    fun ready(context: Context): Boolean = enabled(context) && (portSet() ?: openedThisBoot(context))
 
     /**
      * [ready], as the screens and the question before turning off say it.

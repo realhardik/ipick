@@ -135,10 +135,6 @@ final class AnswerMachine {
 
         boolean muted();
 
-        /** Only an interactive, unlocked call screen can imply a deliberate
-         * takeover by unmuting. Explicit Talk to them does not use this gate. */
-        default boolean allowUnmuteTakeover() { return true; }
-
         /** Start the greeting: lead-in, [checkTone] first if asked, the
          *  greeting, the beep. Asynchronous; calls back checkToneDone (only
          *  with a check tone) and greetingDone. */
@@ -268,6 +264,8 @@ final class AnswerMachine {
     private @Nullable Object audioPoll;
     private long answeredAt;
     private long ringSequence;
+    private long telecomRingCreatedAt;
+    private String messageToken = "";
     private boolean exceptedRing;
     private long manualLimit = -1;
     private @Nullable Object muteWatch;
@@ -294,7 +292,6 @@ final class AnswerMachine {
     /** This machine asked for the hang-up: what follows is the call ending,
      *  not the user taking it - the Honor clears the mute as a call ends. */
     private boolean ending;
-    private boolean unmutedSeen;
     private int automaticRemutes;
     private static final int MAX_AUTOMATIC_REMUTES = 3;
     private volatile boolean answered;
@@ -347,7 +344,10 @@ final class AnswerMachine {
         reset();
         state = State.RINGING;
         ringAt = effects.now();
-        ringSequence++;
+        telecomRingCreatedAt = 0;
+        do {
+            ringSequence = java.util.UUID.randomUUID().getLeastSignificantBits() & Long.MAX_VALUE;
+        } while (ringSequence == 0);
         if (otherAppCall || (!enabled && !testRing)) {
             if (otherAppCall) {
                 effects.log("answer: a call rings during a messenger or meeting call; not answering it");
@@ -394,7 +394,8 @@ final class AnswerMachine {
         }
         if (state == State.RINGING && refused) {
             effects.log("answer: a go-ahead for a ring it will not answer, ignored");
-        } else if (state == State.RINGING) {
+        } else if (state == State.RINGING || (state == State.ARMED && !testCall)) {
+            cancel(answerTimer);
             arm(delayMs, "go-ahead");
         } else if (state == State.IDLE) {
             goAheadAt = effects.now();
@@ -402,6 +403,13 @@ final class AnswerMachine {
         } else {
             effects.log("answer: go-ahead in state " + state + ", ignored");
         }
+    }
+
+    long ringTokenFor(long createdAt) {
+        long token = manualRingToken();
+        if (token == 0) return 0;
+        if (telecomRingCreatedAt == 0) telecomRingCreatedAt = createdAt;
+        return telecomRingCreatedAt == createdAt ? token : -1;
     }
 
     /** A token only for the current ringing call; never queues a future answer. */
@@ -539,6 +547,7 @@ final class AnswerMachine {
         // off-hook. That transition is not a user takeover.
         if (!testCall && !effects.muted() && !restoreMute()) return;
         state = State.GREETING;
+        messageToken = java.util.UUID.randomUUID().toString();
         effects.playGreeting(testCall);
         effects.messageStarted();
         muteWatch = effects.schedule(this::watchMute, MUTE_WATCH_MS);
@@ -644,27 +653,7 @@ final class AnswerMachine {
             return;
         }
         if (!over && mutedAt > 0 && !effects.muted() && effects.callAudioUp()) {
-            if (!effects.allowUnmuteTakeover()) {
-                // A lock-screen/audio-route reset is not consent to open the
-                // microphone or discard the message. Talk to them is explicit.
-                unmutedSeen = false;
-                if (!restoreMute()) return;
-                muteWatch = effects.schedule(this::watchMute, MUTE_WATCH_MS);
-                return;
-            }
-            // Unmuted, and seen so twice in a row with the call still up: the
-            // user took the call from the call screen. Once could be the
-            // caller hanging up - the Honor clears the mute as a call ends,
-            // and the audio mode may follow a moment later; and after
-            // telephony said the call is over, the unmute is the end's.
-            if (unmutedSeen) {
-                effects.log("answer: unmuted from the call screen - the user took the call");
-                talk();
-                return;
-            }
-            unmutedSeen = true;
-        } else {
-            unmutedSeen = false;
+            if (!restoreMute()) return;
         }
         muteWatch = effects.schedule(this::watchMute, MUTE_WATCH_MS);
     }
@@ -828,6 +817,10 @@ final class AnswerMachine {
         return state == State.ANSWERING || state == State.GREETING || state == State.MESSAGE;
     }
 
+    String messageToken() {
+        return !ending && (state == State.GREETING || state == State.MESSAGE) ? messageToken : "";
+    }
+
     /** Whether a diagnostics test call is under way: its ring armed, or the
      *  call answered - not a test ring that ended unanswered. */
     boolean testing() {
@@ -901,7 +894,6 @@ final class AnswerMachine {
         talked = false;
         talkedAt = 0;
         ending = false;
-        unmutedSeen = false;
         automaticRemutes = 0;
         manualLimit = -1;
         exceptedRing = false;

@@ -15,8 +15,6 @@ import com.genymobile.scrcpy.device.Streamer;
 import com.genymobile.scrcpy.util.Ln;
 
 import android.annotation.SuppressLint;
-import android.app.KeyguardManager;
-import android.os.PowerManager;
 import android.content.Context;
 import android.media.AudioManager;
 import android.os.Handler;
@@ -162,8 +160,10 @@ public final class Main {
 
             // Known before anything can connect, so the first connection is
             // checked against the same token as the last.
-            String token = System.getenv(TOKEN_ENV);
-            appToken = token == null ? "" : token;
+            android.os.Bundle bootstrap = bootstrap();
+            String token = bootstrap == null ? null : bootstrap.getString("token");
+            if (token == null || !token.matches("[0-9a-f]{48}")) throw new SecurityException("Bootstrap authentication unavailable");
+            appToken = token;
             recordingMode = modeFromEnvironment(System.getenv(MODE_ENV));
             trackingOn = "1".equals(System.getenv(TRACK_ENV));
             answerSettings = AnswerSettings.parse(System.getenv(ANSWER_ENV));
@@ -312,6 +312,12 @@ public final class Main {
                 Ln.w("answer: could not rebind the telecom context: " + e);
             }
             telecom = telecomManager;
+            try {
+                muteBootCount = android.provider.Settings.Global.getInt(context.getContentResolver(),
+                        android.provider.Settings.Global.BOOT_COUNT, -1);
+            } catch (RuntimeException e) {
+                muteBootCount = -1;
+            }
             answerMachine = new AnswerMachine(new AnswerEffects(handler, audio, telecomManager, telephony));
             AnswerSettings settings = answerSettings;
             answerMachine.configure(settings.on, settings.maxMessageSeconds * 1000L);
@@ -324,6 +330,7 @@ public final class Main {
             // See callWatch.
             callWatch = new CallWatch(audio, handler);
             telephony.registerTelephonyCallback(handler::post, callWatch);
+            watcherReadyAt = System.currentTimeMillis();
             watching = true;
             Ln.i("callwatch: watching call state as uid " + android.os.Process.myUid());
         } catch (Throwable t) {
@@ -363,6 +370,7 @@ public final class Main {
      */
     private static final long STARTED_AT = System.currentTimeMillis();
     private static volatile boolean watching;
+    private static volatile long watcherReadyAt;
     private static final AtomicInteger callEvents = new AtomicInteger();
     private static final AtomicInteger offHooks = new AtomicInteger();
     private static volatile long lastCallEventAt;
@@ -440,7 +448,10 @@ public final class Main {
             // idle; the audio mode changing says (CallStates.audioModeChanged).
             // AudioManager holds its listeners itself, unlike telephony.
             try {
-                audio.addOnModeChangedListener(handler::post, mode -> states.audioModeChanged());
+                audio.addOnModeChangedListener(handler::post, mode -> {
+                    states.audioModeChanged();
+                    if (mode == AudioManager.MODE_NORMAL && !states.inCall()) giveBackStaleMute();
+                });
             } catch (Throwable t) {
                 Ln.w("callwatch: no audio mode callback, so a phone call that ends into an app's call "
                         + "records on until that one ends: " + t);
@@ -484,6 +495,7 @@ public final class Main {
                         machine.idleSignal();
                     }
                     states.idle();
+                    if (!states.inCall() && (machine == null || machine.state() == AnswerMachine.State.IDLE)) giveBackStaleMute();
                     break;
                 default:
                     break;
@@ -683,10 +695,7 @@ public final class Main {
         }
     }
 
-    /** How often to look for the app having been killed in the background. A
-     *  minute: the read is cheap and the warning is advisory, not time-critical
-     *  the way the cable watch is. */
-    private static final long BG_KILL_CHECK_INTERVAL_MS = 60_000L;
+    private static final long BG_KILL_CHECK_INTERVAL_MS = 15 * 60_000L;
 
     /**
      * Watch for THIS PHONE killing the app in the background and, when it
@@ -785,96 +794,21 @@ public final class Main {
 
     }
 
-    /**
-     * Ten seconds. This bounds how long the shield can be down while adbd is
-     * still alive - the case that matters, see keepShieldUp. Cheap: each check
-     * is one tiny native `cmd` binary and a binder call, no wakelock, and a
-     * plain sleep does not wake a sleeping phone, it just runs late. About a
-     * minute of low-clock CPU a day, spread thin.
-     */
-    private static final long SHIELD_CHECK_INTERVAL_MS = 10 * 1000L;
+    private static final long SHIELD_CHECK_INTERVAL_MS = 120_000L;
 
-    /** Every twelfth check - once every two minutes - a heartbeat line with
-     *  both switches and the time. This log is the only durable record on this
-     *  phone (logcat's main buffer rolls in about a minute), and the state of
-     *  the two switches right up to whatever kills this process is the one
-     *  thing every investigation so far had been missing. ~720 lines a day. */
-    private static final int HEARTBEAT_EVERY = 12;
-
-    /**
-     * KEEP THE OFF-WI-FI SHIELD UP, FROM THE ONE PROCESS THAT NEEDS IT.
-     *
-     * This daemon dies when adbd restarts (the restart cgroup-kills adbd's
-     * children), and adbd restarts on Wi-Fi loss unless USB debugging - the
-     * global setting adb_enabled, no cable involved - is on to keep a transport
-     * "enabled" in the framework's eyes. The app turns it on at setup and
-     * re-arms it whenever it revives this daemon, and that was believed to be
-     * enough. It is not: on this phone USB debugging switches ITSELF off some
-     * time after being turned on with no cable attached (measured repeatedly),
-     * and the app only looks again on a keep-alive tick or an open. A Wi-Fi
-     * drop landing in that gap restarts adbd and kills this process. Measured:
-     * a call recorded at 14:19, Wi-Fi off, adbd restarted at 14:21:07, every
-     * call after that unrecorded - and adb_enabled read 1 again by the time
-     * anyone looked, because the app had re-armed it afterwards.
-     *
-     * So this process minds its own shield. Shell can write the setting (the
-     * custodian above writes adb_wifi_enabled the same way), this thread is
-     * never frozen, and it checks every ten seconds - so the shield is down
-     * for seconds at most while adbd is alive. It cannot help once adbd has
-     * already restarted (this process is gone by then; the app's revive covers
-     * that); what it does is stop a drop from ever finding the shield down.
-     *
-     * WHY THIS POLLS, WHEN A ContentObserver IS THE OBVIOUS ANSWER
-     *
-     * An observer on the two settings was built and does not work, and the
-     * platform says exactly why. Since Android 12 the ContentService validates
-     * every registration through ActivityManager's checkContentProviderAccess,
-     * which looks the caller up by PID in its process table - and a process
-     * started from a shell with app_process was never started by the
-     * ActivityManager, so it has no record there. registerContentObserver
-     * returns normally and registers nothing: `dumpsys content` showed the
-     * observer tree without it, and logcat had the refusal, verbatim:
-     *
-     *   W/ContentService: Ignoring content changes for
-     *     content://settings/global/adb_enabled from 2000: Failed to find PID 28158
-     *
-     * No permission, property or context changes that; it is a question of
-     * whether the ActivityManager knows the process, and it does not. The app
-     * could observe - it is a real app - but the app is frozen between calls
-     * on this phone, which is the whole reason this daemon exists. So the
-     * process that is always alive polls, and the one that could observe is
-     * not always alive. Ten seconds it is.
-     *
-     * A read that fails is treated as unknown and skipped, not as "off": writing
-     * on a transient hiccup would be harmless but noisy, and a wrong "off" costs
-     * nothing more than one idempotent write ten seconds later.
-     */
     private static void keepShieldUp() {
-        Ln.i("shield: minding adb_enabled every " + (SHIELD_CHECK_INTERVAL_MS / 1000)
-                + "s, from " + new java.util.Date());
-        int tick = 0;
-        // Check FIRST, then sleep: the state at spawn is itself a data point.
         while (true) {
-            boolean heartbeat = tick++ % HEARTBEAT_EVERY == 0;
-            checkShield(heartbeat ? "heartbeat" : null);
-            if (heartbeat) {
-                ensureTracking();
-            }
+            checkShield();
+            ensureTracking();
+            Handler handler = mainHandler;
+            if (handler != null && MUTE_MARKER.exists()) handler.post(Main::giveBackStaleMute);
             sleep(SHIELD_CHECK_INTERVAL_MS);
         }
     }
 
-    /** One check: put adb_enabled back to 1 if it is anything else, logging
-     *  the restore with its time. With a non-null why, also a heartbeat line
-     *  with both switches; otherwise a quiet check stays quiet. */
-    private static void checkShield(@Nullable String why) {
+    private static void checkShield() {
         try {
             String usb = readGlobal("adb_enabled");
-            if (why != null) {
-                Ln.i("shield: " + why + " adb_enabled=" + usb + " adb_wifi_enabled="
-                        + readGlobal("adb_wifi_enabled") + " pings=" + pings.getAndSet(0)
-                        + " sessions=" + sessions.get() + " at " + new java.util.Date());
-            }
             // Not while debugging is going off by the user's choice
             // (COMMAND_DEBUGGING_OFF): putting it back would undo that.
             if (usb != null && !"1".equals(usb) && !switchingOff) {
@@ -896,12 +830,8 @@ public final class Main {
     private static final String SETTINGS = "/system/bin/settings";
 
     /**
-     * `settings put global name value`, read back: true if it now says so. An
-     * OPPO, OnePlus or realme phone with its Developer options switch off
-     * refuses the shell this write (the app's ShellGrant; CallVault measured
-     * `settings put` refused on a OnePlus 9, 2026-09-16), and the write's
-     * exit says nothing - so what the phone said is logged, its first lines.
-     * Writing USB debugging off ends this process with adbd: no read-back.
+     * Read the setting back because some devices reject the write silently.
+     * Turning off USB debugging can stop this process before read-back.
      */
     private static boolean putGlobal(String name, String value) {
         try {
@@ -947,6 +877,7 @@ public final class Main {
      *  takes a fraction of one. A read is one binder call, about 0.2 ms
      *  measured, and a sleeping phone runs none of them. */
     private static final long CABLE_CHECK_INTERVAL_MS = 1000L;
+    private static final long UNPLUGGED_CHECK_MS = 30_000L;
 
     /** How often to look again for a USB service, or ports, not there yet. */
     private static final long CABLE_PORTS_RETRY_MS = 60 * 1000L;
@@ -1028,7 +959,7 @@ public final class Main {
             Ln.w("cable: the USB service went before its ports could be watched");
             return;
         }
-        Ln.i("cable: watching USB port(s) " + ports + " every " + CABLE_CHECK_INTERVAL_MS / 1000 + "s");
+        Ln.i("cable: watching USB ports " + ports);
         Boolean before = null;
         while (true) {
             int[] modes = new int[ports.size()];
@@ -1048,7 +979,7 @@ public final class Main {
                 }
                 before = in;
             }
-            sleep(CABLE_CHECK_INTERVAL_MS);
+            sleep(Boolean.TRUE.equals(before) ? CABLE_CHECK_INTERVAL_MS : UNPLUGGED_CHECK_MS);
         }
     }
 
@@ -1211,7 +1142,7 @@ public final class Main {
      * to ask was to connect, which started a capture session and tore an
      * AudioRecord up and down on every health check.
      */
-    private static final int PROTOCOL_VERSION = 2;
+    private static final int PROTOCOL_VERSION = 3;
     private static final int COMMAND_HELLO = 'A';
     private static final int NONCE_BYTES = 16;
     private static final int MAC_BYTES = 32;
@@ -1224,9 +1155,6 @@ public final class Main {
      *  has callers; past it a connection is dropped rather than queued. */
     private static final int MAX_SESSIONS = 8;
     private static final AtomicInteger sessions = new AtomicInteger();
-    /** Pings since the last heartbeat line. Counted there rather than logged
-     *  one by one: the keep-alive pings several times a visit, all day. */
-    private static final AtomicInteger pings = new AtomicInteger();
     private static volatile int listenPort = DEFAULT_PORT;
 
     /** A refusal is logged at most this often, with a running count, so a
@@ -1242,7 +1170,6 @@ public final class Main {
     /** A USB cable went in or came out: adbd may be about to go. See watchCable. */
     private static final String ACTION_CABLE = "app.ipick.voicemail.CABLE";
     private static final String ACTION_BACKGROUND_KILLED = "app.ipick.voicemail.BACKGROUND_KILLED";
-    private static final String TOKEN_ENV = "IPICK_TOKEN";
     private static final String JAR_PATH = "/data/local/tmp/ipick-capture.jar";
     private static final String LOG_PATH = "/data/local/tmp/ipick-capture.out";
 
@@ -1449,31 +1376,12 @@ public final class Main {
     private static final String TRACK_ENV = "IPICK_TRACK";
     private static volatile boolean trackingOn;
 
-    /**
-     * The rules on whose calls to keep said no to a phone call while it was
-     * still ringing or being dialled (the app's CallTracker knows the number
-     * by then): do not record it. A recording that started a moment ago for
-     * it - dialling takes the phone off-hook at once - is stopped and deleted.
-     */
-    private static final int COMMAND_SKIP = 'K';
-    /** A skip is for the call starting now, not for one an hour later. */
-    private static final long SKIP_VALID_MS = 60_000L;
-    private static final long SKIP_CURRENT_MS = 8_000L;
-    private static volatile long skipUntil;
-
-    /**
-     * THE ANSWERING MACHINE - see AnswerMachine. Its settings ("on,seconds,
-     * route") arrive in the environment at spawn and over 'N' when the user
-     * changes them, the way the mode does, and default to off. The app's
-     * go-ahead for a ringing call is 'Y' (four bytes: the delay in ms, or -1
-     * to take it back); 'H' is Talk to them ('T') or Hang up ('H') during a
-     * message; 'G' handles the greeting and 'X' the diagnostics.
-     */
     private static final int COMMAND_ANSWER_SETTINGS = 'N';
-    private static final int COMMAND_GO_AHEAD = 'Y';
+    private static final int COMMAND_GO_AHEAD = 'y';
+    private static final int COMMAND_RING_TOKEN = 'r';
     private static final int COMMAND_MANUAL_VOICEMAIL = 'J';
     private static final int COMMAND_EXCLUDE_RING = 'I';
-    private static final int COMMAND_HANDOVER = 'H';
+    private static final int COMMAND_HANDOVER = 'h';
     private static final int COMMAND_GREETING = 'G';
     private static final int COMMAND_DIAGNOSE = 'X';
     private static final String ANSWER_ENV = "IPICK_ANSWER";
@@ -1481,6 +1389,7 @@ public final class Main {
     private static final String ACTION_MESSAGE_TAKEN = "app.ipick.voicemail.MESSAGE_TAKEN";
     /** Left while this process holds the microphone muted, so a restart in
      *  the middle of a message gives the microphone back. */
+    private static int muteBootCount = -1;
     private static final File MUTE_MARKER = new File("/data/local/tmp/ipick-muted");
 
     private static volatile AnswerSettings answerSettings = AnswerSettings.OFF;
@@ -1526,10 +1435,6 @@ public final class Main {
             String mode = trackingOn ? "allow" : "default";
             String said = runQuietly("cmd", "appops", "set", "--uid", APP_PACKAGE, "MANAGE_ONGOING_CALLS", mode);
             runQuietly("cmd", "appops", "set", APP_PACKAGE, "MANAGE_ONGOING_CALLS", mode);
-            // Silent when it works. An OPPO, OnePlus or realme phone with its
-            // Developer options switch off refuses the shell this (CallVault,
-            // measured on a OnePlus 9, 2026-09-16; the app's ShellGrant): its
-            // first lines, as the stack trace after them runs to twenty.
             if (said != null && !said.isEmpty()) {
                 Ln.w("tracking: Android said " + said.substring(0, Math.min(said.length(), 300)));
             }
@@ -1934,11 +1839,7 @@ public final class Main {
                 beginRecording(incoming, null, null);
                 return;
             }
-            if (app == null && skipUntil > System.currentTimeMillis()) {
-                skipUntil = 0;
-                Ln.i("recording: the rules leave this call out; not recording it");
-                return;
-            }
+
         }
         // Ordinary answered, outgoing and internet calls never start capture.
 
@@ -2377,33 +2278,6 @@ public final class Main {
             client.getOutputStream().flush();
             return;
         }
-        if (command == COMMAND_SKIP) {
-            int value = client.getInputStream().read();
-            String what;
-            synchronized (Main.class) {
-                RecordingSession rec = activeRecording;
-                if (value != 1) {
-                    skipUntil = 0;
-                    what = "cancelled";
-                } else if (rec != null && rec.app == null
-                        && System.currentTimeMillis() - rec.startedAt < SKIP_CURRENT_MS) {
-                    // Dialling went off-hook before the app could say: stop
-                    // it now, and leave nothing behind.
-                    rec.stop();
-                    activeRecording = null;
-                    boolean gone = new File(REC_DIR, rec.name).delete();
-                    Ln.i("recording: the rules leave this call out; stopped and deleted " + rec.name + " -> " + gone);
-                    wake(ACTION_CALL_ENDED, rec.incoming, "", null);
-                    what = "current";
-                } else {
-                    skipUntil = System.currentTimeMillis() + SKIP_VALID_MS;
-                    what = "next";
-                }
-            }
-            client.getOutputStream().write(("SKIP " + what + "\n").getBytes(StandardCharsets.UTF_8));
-            client.getOutputStream().flush();
-            return;
-        }
         if (command == COMMAND_SET_VOIP) {
             // The messenger apps whose calls to record, comma-separated.
             Set<String> apps = Voip.parse(readName(client));
@@ -2475,7 +2349,7 @@ public final class Main {
             if (machine != null) {
                 onMain(() -> {
                     machine.configure(settings.on, settings.maxMessageSeconds * 1000L);
-                    if (settings == AnswerSettings.TEXT_ONLY) machine.cancelPendingAnswers();
+                    if (!settings.on) machine.cancelPendingAnswers();
                     return null;
                 });
             }
@@ -2490,16 +2364,27 @@ public final class Main {
             reply(client, ignored ? "IGNORE yes" : "IGNORE no");
             return;
         }
+        if (command == COMMAND_RING_TOKEN) {
+            long createdAt = new DataInputStream(client.getInputStream()).readLong();
+            AnswerMachine machine = answerMachine;
+            if (!watching || machine == null || goingOff || createdAt <= watcherReadyAt
+                    || createdAt > System.currentTimeMillis()) {
+                reply(client, "RING unavailable");
+            } else {
+                reply(client, "RING " + onMain(() -> goingOff ? -1L : machine.ringTokenFor(createdAt)));
+            }
+            return;
+        }
         if (command == COMMAND_MANUAL_VOICEMAIL) {
             long token = new DataInputStream(client.getInputStream()).readLong();
             AnswerMachine machine = answerMachine;
             if (machine == null) { reply(client, "MANUAL unavailable"); return; }
-            if (token == 0) {
-                reply(client, "RING " + onMain(machine::manualRingToken));
+            if (token <= 0) {
+                reply(client, "MANUAL unavailable");
             } else {
                 AnswerSettings requested = AnswerSettings.parse(readName(client));
                 String result = onMain(() -> {
-                    if (token != machine.manualRingToken()) return "stale";
+                    if (goingOff || token != machine.manualRingToken()) return "stale";
                     // Preserve automatic response on/off; only this call overrides SMS.
                     answerSettings = new AnswerSettings(answerSettings.on,
                             requested.maxMessageSeconds, requested.route, requested.screenOff);
@@ -2512,23 +2397,15 @@ public final class Main {
         if (command == COMMAND_GO_AHEAD) {
             DataInputStream in = new DataInputStream(client.getInputStream());
             int delay = in.readInt();
-            // When the app saw the ring - eight more bytes, from 0.17 on.
-            long rangAt;
-            try {
-                rangAt = in.readLong();
-            } catch (java.io.EOFException e) {
-                rangAt = 0;
-            }
-            // On the machine's clock as it comes: SystemClock.elapsedRealtime,
-            // since boot, is the same clock in the app and here - and a
-            // wall-clock step between the ring and now cannot move it.
-            final long rang = rangAt;
+            long rang = in.readLong();
+            long token = in.readLong();
             AnswerMachine machine = answerMachine;
             if (machine == null) {
                 reply(client, "GO none");
                 return;
             }
             String state = onMain(() -> {
+                if (goingOff || token <= 0 || token != machine.manualRingToken()) return "stale";
                 if (delay < 0) {
                     machine.cancelGoAhead();
                 } else {
@@ -2541,12 +2418,14 @@ public final class Main {
         }
         if (command == COMMAND_HANDOVER) {
             int what = client.getInputStream().read();
+            String session = readName(client);
             AnswerMachine machine = answerMachine;
             if (machine == null) {
                 reply(client, "HAND none");
                 return;
             }
             String state = onMain(() -> {
+                if (session.isEmpty() || !session.equals(machine.messageToken())) return "stale";
                 if (what == 'T') {
                     // The notification's Talk, or the app seeing a second call
                     // answered: the machine tells the app (callTaken).
@@ -2685,8 +2564,8 @@ public final class Main {
                     reply(client, "TEST busy");
                     break;
                 }
-                if (answerSettings == AnswerSettings.TEXT_ONLY) {
-                    reply(client, "TEST text-mode");
+                if (!answerSettings.on) {
+                    reply(client, "TEST disabled");
                     break;
                 }
                 testState = "armed";
@@ -2698,10 +2577,16 @@ public final class Main {
                 testMuteHeld = -1;
                 testVoice = -1;
                 testPlayed = -1;
-                onMain(() -> {
-                    if (answerSettings != AnswerSettings.TEXT_ONLY) machine.armTest(incoming, incoming ? TEST_INCOMING_WINDOW_MS : TEST_OUTGOING_WINDOW_MS);
-                    return null;
-                });
+                boolean armed = Boolean.TRUE.equals(onMain(() -> {
+                    if (!answerSettings.on) return false;
+                    machine.armTest(incoming, incoming ? TEST_INCOMING_WINDOW_MS : TEST_OUTGOING_WINDOW_MS);
+                    return true;
+                }));
+                if (!armed) {
+                    testState = "idle";
+                    reply(client, "TEST disabled");
+                    break;
+                }
                 if (!incoming) {
                     runQuietly("am", "start", "-a", "android.intent.action.CALL",
                             "-d", "tel:" + number.replace("#", "%23"));
@@ -2880,6 +2765,7 @@ public final class Main {
         private final TelephonyManager phone;
         private final VoicemailScreenSleep screenSleep = new VoicemailScreenSleep();
         private long greetingSession;
+        private boolean ownsMute;
 
         AnswerEffects(Handler mainHandler, AudioManager callAudio, TelecomManager telecom, TelephonyManager phone) {
             this.mainHandler = mainHandler;
@@ -2950,12 +2836,14 @@ public final class Main {
         @Override
         @SuppressWarnings("deprecation")
         public boolean answer() {
-            if (!muteReady) {
+            if (!muteReady || goingOff || !watching) {
                 Ln.w("answer: the microphone cannot be muted from here; not answering");
                 return false;
             }
             try {
-                log("answer: accepting call; unlocked interactive screen=" + allowUnmuteTakeover());
+                if (MUTE_MARKER.exists() || callAudio.isMicrophoneMute()
+                        || phone.getCallState() != TelephonyManager.CALL_STATE_RINGING) return false;
+                log("answer: accepting call");
                 telecom.acceptRingingCall();
                 return true;
             } catch (Throwable t) {
@@ -2987,23 +2875,21 @@ public final class Main {
 
         @Override
         public void setMuted(boolean on) {
-            if (on) {
-                // The marker first: a death between the two leaves a marker
-                // for a mute that never happened, which costs an unneeded
-                // unmute at the next start. The other order could leave a
-                // muted phone and nothing to say so. A marker that cannot be
-                // left does not stop the mute: the caller hearing the room is
-                // worse, and the phone clears the mute as the call ends.
-                try {
-                    new FileOutputStream(MUTE_MARKER).close();
-                } catch (Throwable t) {
-                    Ln.e("answer: could not leave the mute marker", t);
-                }
-            }
             try {
+                if (on && !ownsMute) {
+                    if (callAudio.isMicrophoneMute() || !MUTE_MARKER.createNewFile()) return;
+                    ownsMute = true;
+                    if (muteBootCount >= 0) {
+                        try (java.io.DataOutputStream marker = new java.io.DataOutputStream(new FileOutputStream(MUTE_MARKER))) {
+                            marker.writeInt(muteBootCount);
+                        }
+                    }
+                }
+                if (!on && !ownsMute) return;
                 callAudio.setMicrophoneMute(on);
                 if (!on) {
-                    MUTE_MARKER.delete();
+                    ownsMute = false;
+                    if (!callAudio.isMicrophoneMute()) MUTE_MARKER.delete();
                 }
                 AnswerMachine machine = answerMachine;
                 if (on && machine != null && machine.testing()) {
@@ -3020,20 +2906,6 @@ public final class Main {
         @Override
         public boolean muted() {
             return callAudio.isMicrophoneMute();
-        }
-
-        @Override
-        public boolean allowUnmuteTakeover() {
-            try {
-                Context context = FakeContext.get();
-                KeyguardManager keyguard = (KeyguardManager) context.getSystemService(Context.KEYGUARD_SERVICE);
-                PowerManager power = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
-                return keyguard != null && power != null && power.isInteractive() && !keyguard.isKeyguardLocked();
-            } catch (Throwable t) {
-                // Unknown is not a deliberate user action. The notification's
-                // authenticated Talk to them command remains available.
-                return false;
-            }
         }
 
         @Override
@@ -3121,7 +2993,8 @@ public final class Main {
             }
             // Only that a message is under way: where it starts, the
             // recording's name says at the end.
-            wake(ACTION_MESSAGE_STARTED, true, "", null, "--ez", "test", String.valueOf(test));
+            wake(ACTION_MESSAGE_STARTED, true, "", null, "--ez", "test", String.valueOf(test),
+                    "--es", "message_session", machine == null ? "" : machine.messageToken());
         }
 
         @Override
@@ -3193,30 +3066,26 @@ public final class Main {
      *  microphone may still be muted. Give it back. False while a call is up
      *  and the mute is left for its end; true when nothing is left to do. */
     private static boolean giveBackStaleMute() {
-        if (!MUTE_MARKER.exists() || callAudio == null) {
-            return true;
-        }
+        if (!MUTE_MARKER.exists()) return true;
         try {
-            int mode = callAudio.getMode();
-            if (mode == AudioManager.MODE_IN_CALL || mode == AudioManager.MODE_IN_COMMUNICATION) {
-                // A call is up: the message this mute was for, its caller
-                // still on - muted, the room stays out - or a call of the
-                // user's, muted by them. Not this process's to unmute: the
-                // marker is looked at again as that call ends (endCall).
-                Ln.i("answer: a mute left by a message, and a call up; the microphone stays until it ends");
-                return false;
+            if (answerMachine != null && answerMachine.takingMessage()) return false;
+            if (muteBootCount >= 0 && MUTE_MARKER.length() == Integer.BYTES) {
+                try (DataInputStream marker = new DataInputStream(new FileInputStream(MUTE_MARKER))) {
+                    if (marker.readInt() != muteBootCount) return MUTE_MARKER.delete();
+                }
             }
-        } catch (Throwable ignored) {
-            // Cannot tell: as before, give it back.
-        }
-        try {
-            callAudio.setMicrophoneMute(false);
-            Ln.w("answer: the microphone was left muted by a message; unmuted it");
+            if (phone == null || callAudio == null || telecom == null || telecom.isInCall()
+                    || phone.getCallState() != TelephonyManager.CALL_STATE_IDLE
+                    || callAudio.getMode() != AudioManager.MODE_NORMAL) return false;
+            if (callAudio.isMicrophoneMute()) {
+                callAudio.setMicrophoneMute(false);
+                if (callAudio.isMicrophoneMute()) return false;
+            }
+            return MUTE_MARKER.delete();
         } catch (Throwable t) {
-            Ln.e("answer: could not unmute the microphone a previous run muted", t);
+            Ln.w("answer: could not safely restore the previous microphone state: " + t);
+            return false;
         }
-        MUTE_MARKER.delete();
-        return true;
     }
 
     /** The whole of `dumpsys <service>`, newlines kept, for the parsers;
@@ -3262,7 +3131,6 @@ public final class Main {
     }
 
     private static void pong(Socket client) throws IOException {
-        pings.incrementAndGet();
         client.getOutputStream().write(
                 ("PONG " + PROTOCOL_VERSION + " " + BUILD + "\n").getBytes(StandardCharsets.UTF_8));
         client.getOutputStream().flush();
@@ -3451,6 +3319,19 @@ public final class Main {
     }
 
     private static volatile int appUid = -1;
+
+    private static android.os.Bundle bootstrap() throws android.os.RemoteException {
+        String authority = APP_PACKAGE + ".bootstrap";
+        android.os.IBinder lease = new android.os.Binder();
+        com.genymobile.scrcpy.wrappers.ActivityManager manager = com.genymobile.scrcpy.wrappers.ServiceManager.getActivityManager();
+        android.content.IContentProvider provider = manager.getContentProviderExternal(authority, lease);
+        if (provider == null) throw new SecurityException("Bootstrap provider is unavailable");
+        try {
+            return provider.call(FakeContext.get().getAttributionSource(), authority, "bootstrap", null, null);
+        } finally {
+            manager.removeContentProviderExternal(authority, lease);
+        }
+    }
 
     private static int appUid(boolean fresh) {
         if (fresh || appUid < 0) {

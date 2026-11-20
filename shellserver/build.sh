@@ -11,16 +11,7 @@ SDK="${ANDROID_HOME:-$HOME/Library/Android/sdk}"
 ANDROID_PLATFORM="${ANDROID_PLATFORM:-36}"
 BUILD_TOOLS="${BUILD_TOOLS:-36.1.0}"
 
-# THE JAVAC MAJOR IS PART OF THE BUILD, and it is checked, not assumed.
-#
-# --release 17 fixes the class-file level, not the bytes: measured on 0.3, JDK
-# 17 and JDK 21 turned these same sources into dex files 264 bytes apart. So
-# every machine that builds a release has to compile with the same major, or
-# the APK cannot be reproduced and F-Droid cannot publish the one signed here.
-# 21 is what F-Droid's build server runs (Debian trixie, default-jdk), so 21
-# is what CI installs and what this script insists on. When that moves, move
-# all three together. IPICK_JAVA_HOME points at a JDK explicitly; otherwise
-# JAVA_HOME, then whatever javac is on the PATH.
+# Pin the compiler major for reproducible dex output.
 JDK_MAJOR="${IPICK_JDK_MAJOR:-21}"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -66,19 +57,14 @@ public final class BuildConfig {
 }
 EOF
 
-find "$HERE/src" "$OUT/gen" -name '*.java' > "$OUT/sources.txt"
+find "$HERE/src" "$OUT/gen" "$HERE/../app/src/main/java/app/ipick/voicemail/answering/GreetingCue.java" -name '*.java' > "$OUT/sources.txt"
 echo "compiling $(wc -l < "$OUT/sources.txt" | tr -d ' ') files against android-$ANDROID_PLATFORM"
 
-# -nowarn because the fork deliberately calls deprecated and hidden APIs; that
-# is the entire technique, and a wall of warnings about it hides real problems.
+# The helper calls deprecated Android APIs for platform compatibility.
 echo "javac: $JAVAC ($("$JAVAC" --version))"
 "$JAVAC" --release 17 -nowarn -cp "$ANDROID_JAR" -d "$OUT/classes" "@$OUT/sources.txt"
 
-# d8 writes the jar itself when --output names one. Not a shortcut: it stamps
-# the classes.dex entry with the epoch, so the same classes give the same bytes
-# every time. The `zip` step this replaced stamped in the build's wall-clock
-# time, which made every APK differ in this one asset and would have failed
-# F-Droid's reproducible-build check for no reason a person would ever find.
+# Let d8 write the jar so its timestamps are reproducible.
 echo "dexing with build-tools $BUILD_TOOLS"
 find "$OUT/classes" -name '*.class' > "$OUT/classes.txt"
 "$D8" --lib "$ANDROID_JAR" --min-api 31 --output "$JAR" @"$OUT/classes.txt"

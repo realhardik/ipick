@@ -214,6 +214,35 @@ public class AnswerMachineTest {
     }
 
     @Test
+    public void enteringDndReplacesThePendingDelayWithAnImmediateAnswer() {
+        on();
+        machine.ringing();
+        machine.goAhead(20_000L, world.now);
+        world.advance(3_000L);
+        machine.goAhead(0L, world.now);
+        world.advance(0L);
+        assertDid("answer");
+        machine.offHook(true);
+        world.advance(AnswerMachine.AUDIO_POLL_MS);
+        world.advance(20_000L);
+        assertDid("answer", "mute", "greeting", "message started");
+    }
+
+    @Test
+    public void leavingDndBeforeAnswerRestoresTheDelayFromTheOriginalRing() {
+        on();
+        machine.ringing();
+        machine.goAhead(20_000L, world.now);
+        world.advance(3_000L);
+        machine.goAhead(0L, world.now);
+        machine.goAhead(20_000L, world.now);
+        world.advance(16_999L);
+        assertDid();
+        world.advance(1L);
+        assertDid("answer");
+    }
+
+    @Test
     public void screenSleepCannotStartWhileRingingOrWaitingForAudio() {
         on();
         assertFalse(machine.greetingInProgress());
@@ -645,21 +674,18 @@ public class AnswerMachineTest {
     }
 
     @Test
-    public void anUnmuteFromTheCallScreenIsTalkToThem() {
+    public void unexpectedUnmuteRestoresMuteWithoutTakingTheCall() {
         answeredWithGreeting();
         machine.greetingDone();
         world.muted = false;
-        world.advance(AnswerMachine.MUTE_WATCH_MS);
-        // Seen once: not yet - it could be the call ending.
+        world.advance(2 * AnswerMachine.MUTE_WATCH_MS);
         assertEquals(AnswerMachine.State.MESSAGE, machine.state());
-        world.advance(AnswerMachine.MUTE_WATCH_MS);
-        assertEquals(AnswerMachine.State.TALKING, machine.state());
-        world.advance(120_000L);
-        assertFalse(world.did.contains("hang up"));
-        // Never muted again over the user.
-        assertEquals(1, world.did.stream().filter("mute"::equals).count());
-        // And the app's "Taking a message" is told it is over.
-        assertTrue(world.did.contains("call taken"));
+        assertTrue(world.muted);
+        assertEquals(2, world.did.stream().filter("mute"::equals).count());
+        assertFalse(world.did.contains("call taken"));
+        world.advance(60_000L);
+        assertTrue(world.did.contains("hang up"));
+        assertFalse(machine.callEnded().talked);
     }
 
     @Test
@@ -1257,10 +1283,6 @@ public class AnswerMachineTest {
 
     @Test
     public void anOffHookAfterAnIdleIsTheCallGoingOn() {
-        // CallStates takes an off-hook inside its end check for the same call
-        // going on, and then never says callGoesOn: the caller must be heard
-        // again, and the user's unmute be theirs - or the limit would hang up
-        // a call that goes on.
         answeredWithGreeting();
         machine.greetingDone();
         world.advance(1_000L);
@@ -1271,6 +1293,9 @@ public class AnswerMachineTest {
         speak(1_000L);
         world.muted = false;
         world.advance(2 * AnswerMachine.MUTE_WATCH_MS);
+        assertEquals(AnswerMachine.State.MESSAGE, machine.state());
+        assertTrue(world.muted);
+        machine.talk();
         assertEquals(AnswerMachine.State.TALKING, machine.state());
         assertEquals(spoke, machine.callEnded().speechAt);
     }
@@ -1515,11 +1540,43 @@ public class AnswerMachineTest {
     }
 
     @Test
-    public void unmutingFromTheCallScreenDuringTheGreetingTakesTheCall() {
+    public void unexpectedUnmuteDuringTheGreetingRestoresMute() {
         answeredWithGreeting();
         world.muted = false;
         world.advance(2 * AnswerMachine.MUTE_WATCH_MS);
-        assertTrue(world.did.contains("call taken"));
+        assertTrue(world.muted);
+        assertTrue(world.playing);
+        assertEquals(AnswerMachine.State.GREETING, machine.state());
+        assertEquals(2, world.did.stream().filter("mute"::equals).count());
+        assertFalse(world.did.contains("call taken"));
+    }
+
+    @Test
+    public void failureToRestoreMuteStopsTheGreetingAndHangsUp() {
+        answeredWithGreeting();
+        world.muted = false;
+        world.muteTakes = false;
+        world.did.clear();
+        world.advance(AnswerMachine.MUTE_WATCH_MS);
+        assertDid("mute", "stop greeting", "hang up");
+        assertFalse(world.playing);
+        assertFalse(machine.greetingInProgress());
+    }
+
+    @Test
+    public void repeatedAudioResetsEndTheCallAfterThreeMuteRestorations() {
+        answeredWithGreeting();
+        for (int attempt = 0; attempt < 3; attempt++) {
+            world.muted = false;
+            world.advance(AnswerMachine.MUTE_WATCH_MS);
+            assertTrue(world.muted);
+            assertFalse(world.did.contains("hang up"));
+        }
+        world.did.clear();
+        world.muted = false;
+        world.advance(AnswerMachine.MUTE_WATCH_MS);
+        assertDid("stop greeting", "hang up");
+        assertFalse(machine.greetingInProgress());
     }
 
     /** A test call, answered, its greeting and check tone playing UNMUTED -

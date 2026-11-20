@@ -1,6 +1,7 @@
 package app.ipick.voicemail.shell;
 
 import com.genymobile.scrcpy.util.Ln;
+import app.ipick.voicemail.answering.GreetingCue;
 
 import android.media.AudioAttributes;
 import android.media.AudioDeviceInfo;
@@ -19,7 +20,6 @@ final class GreetingPlayer {
     static final long LEAD_IN_MS = 1_500L;
     static final long CHECK_TONE_MS = 1_000L;
     static final long AFTER_TONE_MS = 500L;
-    static final long GAP_MS = 500L;
     /** The check tone: apart from the chime's notes, so the two are told apart. */
     static final int CHECK_TONE_HZ = 1_400;
     private static final double TONE_AMPLITUDE = 4_000;
@@ -119,7 +119,7 @@ final class GreetingPlayer {
                 return;
             }
             // Whole blocks, so the loudness of what follows lines up with them.
-            byte[] words = read(greeting);
+            byte[] words = GreetingCue.appendTo(read(greeting));
             words = java.util.Arrays.copyOf(words, (words.length + BLOCK_FRAMES * 2 - 1) / (BLOCK_FRAMES * 2) * BLOCK_FRAMES * 2);
             tr.play();
             long started = SystemClock.elapsedRealtime();
@@ -139,8 +139,6 @@ final class GreetingPlayer {
                 listener.checkToneDone();
             }
             frames += write(session, tr, words);
-            frames += write(session, tr, new byte[framesOf(GAP_MS) * 2]);
-            frames += write(session, tr, Checks.chime(RATE, TONE_AMPLITUDE));
             if (!waitPlayed(session, tr, frames)) {
                 failUnlessStopped(session, listener, "the greeting did not play to the end");
                 return;

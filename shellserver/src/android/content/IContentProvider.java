@@ -1,5 +1,6 @@
 package android.content;
 
 public interface IContentProvider {
-    // android.content.IContentProvider is hidden, this is a fake one to expose the type to the project
+    android.os.Bundle call(AttributionSource source, String authority, String method,
+            String arg, android.os.Bundle extras) throws android.os.RemoteException;
 }
