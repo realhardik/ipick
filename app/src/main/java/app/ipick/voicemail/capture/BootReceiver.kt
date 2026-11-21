@@ -27,7 +27,7 @@ import android.util.Log
  * daemon must be revived - but that needs ADB and therefore Wi-Fi, which may
  * not be up the instant boot completes. The job kicks once immediately and
  * then retries with backoff until Wi-Fi arrives, and schedules the periodic
- * heartbeat. No foreground service, no notification, until an actual call.
+ * heartbeat.
  */
 class BootReceiver : BroadcastReceiver() {
 

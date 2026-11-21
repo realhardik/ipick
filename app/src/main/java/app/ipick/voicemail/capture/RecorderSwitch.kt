@@ -39,6 +39,7 @@ object RecorderSwitch {
             putBoolean(KEY, on)
             putLong(StatusRepository.EPOCH, StatusRepository.generation(context) + 1)
         }
+        if (!on) RecorderHealth.clear(context)
         MissedCalls.coverageChanged(context)
         // A stop while the switch was off cost no call: from here on only
         // newer ones count, however the switch was flipped (app or tile).
@@ -74,7 +75,8 @@ object RecorderSwitch {
             // stands down while it is still off (DebugSwitchesOff).
             DebugSwitchesOff.switchBackOn(context)
             // The user's own On: not held to a routine revive's limits.
-            if (!StatusRepository.autoText(context)) CaptureDaemon.revive(context, request = CaptureDaemon.Request.USER)
+            if (StatusRepository.autoText(context)) RecorderKeepAlive.kickNow(context)
+            else CaptureDaemon.revive(context, request = CaptureDaemon.Request.USER)
             RecorderKeepAlive.schedule(context)
             NetworkRevive.arm(context)
             CaptureDaemon.pushMode(context)

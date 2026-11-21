@@ -13,6 +13,7 @@ import app.ipick.voicemail.calls.CallTracking
 import app.ipick.voicemail.calls.CoverageHistory
 import app.ipick.voicemail.calls.VoipApps
 import app.ipick.voicemail.ui.Setup
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -481,12 +482,18 @@ object CaptureDaemon {
         val alive = lifecycle.withLock {
             AdbTransport.forgetLastConnect()
             ReviveLog.note(context, "revive: start")
-            reviveLocked(context, onPortChange, request, found)
+            val available = try {
+                reviveLocked(context, onPortChange, request, found)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.w(TAG, "Helper recovery failed", e)
+                probeConfirmed(context) != null
+            }
+            RecorderHealth.onRevive(context, available, found.connect)
+            available
         }
         ReviveLog.note(context, "revive: ${if (alive) "recorder up" else "recorder down"} (connect ${found.connect})")
-        // Every revive is a reading of whether the recorder is up, and the
-        // one place the user hears about it when it is not. See RecorderHealth.
-        RecorderHealth.onRevive(context, alive, found.connect)
         if (alive) {
             CableWatch.forget(context)
             NetworkRevive.forgetSwitchedOn(context)
@@ -1424,7 +1431,7 @@ object CaptureDaemon {
      * after a reboot - not when a call starts, by which time it may be too late.
      */
     suspend fun ensureRunning(context: Context): Result<Unit> = withContext(Dispatchers.IO) {
-        lifecycle.withLock { ensureRunningLocked(context) }
+        lifecycle.withLock { ensureRunningLocked(context).onSuccess { RecorderHealth.clear(context) } }
     }
 
     private suspend fun ensureRunningLocked(context: Context): Result<Unit> {

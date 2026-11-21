@@ -18,6 +18,7 @@ import app.ipick.voicemail.capture.CaptureDaemon
 import app.ipick.voicemail.capture.DebugSwitchesOff
 import app.ipick.voicemail.capture.DebugNotificationCleaner
 import app.ipick.voicemail.capture.GlobalSettings
+import app.ipick.voicemail.capture.RecorderHealth
 import app.ipick.voicemail.capture.RecorderSwitch
 import app.ipick.voicemail.capture.RecordingMode
 import app.ipick.voicemail.capture.RecordingStore
@@ -253,6 +254,7 @@ object Setup {
 
     fun reopenConnection(context: Context) {
         Prefs.of(context).edit { remove(KEY_COMPLETE) }
+        RecorderHealth.clear(context)
     }
 
     /**
@@ -784,6 +786,7 @@ object Setup {
         DebugNotificationCleaner.forget(context)
         // Setup asks the background question again, so no old warning about it.
         BackgroundKill.forget(context)
+        RecorderHealth.clear(context)
         // When IPick is off back to its default, and Developer options back
         // if it hid them: setup's second step goes there.
         DebugSwitchesOff.forget(context)

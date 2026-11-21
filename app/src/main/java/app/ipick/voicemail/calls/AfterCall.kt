@@ -380,10 +380,16 @@ internal object AfterCall {
     }
 
     /** Posts a [problem] notification as [id], logging as [what] if it cannot. */
-    internal fun notifyProblem(context: Context, id: Int, notification: Notification, what: String) {
-        runCatching { context.getSystemService(NotificationManager::class.java).notify(id, notification) }
-            .onFailure { Log.w(TAG, "$what: could not post", it) }
-    }
+    internal fun notifyProblem(context: Context, id: Int, notification: Notification, what: String): Boolean =
+        runCatching {
+            val manager = context.getSystemService(NotificationManager::class.java)
+            if (!manager.areNotificationsEnabled() ||
+                manager.getNotificationChannel(notification.channelId)?.importance == NotificationManager.IMPORTANCE_NONE) {
+                return@runCatching false
+            }
+            manager.notify(id, notification)
+            true
+        }.onFailure { Log.w(TAG, "$what: could not post", it) }.getOrDefault(false)
 
     /** "Call not recorded" - the hang-up's save, or a collection that found
      *  out later. */

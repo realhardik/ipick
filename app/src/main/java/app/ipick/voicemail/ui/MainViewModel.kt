@@ -709,7 +709,7 @@ class MainViewModel @JvmOverloads constructor(
      */
     fun pairAgain() {
         Setup.forgetPairing(getApplication())
-        RecorderHealth.pairingAgain(getApplication())
+        RecorderHealth.clear(getApplication())
         // Refused no longer, until a revive says so again: kept, setup back on
         // READY by itself - the pairing fine after all - was sent straight
         // back here.
